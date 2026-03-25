@@ -1,0 +1,96 @@
+# ============================================================
+# PixArt-Sigma 过拟合测试配置 (Flow Matching)
+#
+# 目的：用 96 张图片验证 Flow Matching 全参数微调是否能完全拟合训练数据，
+#       loss 应稳步下降趋近 0，生成图应越来越接近原图。
+#
+# 与 LoRA overfit 的关键区别：
+#   overfitlora → LoRA delta 参数学习（低秩）
+#   overfitpixart → Transformer 全参数学习（611M 参数，表达能力最强）
+#
+# 数据集：96 张图片（data/overfit_test/train/）
+#
+# 过拟合全参数微调参数选择原则：
+#   - 全量参数可训练 → 表达能力最强，最容易拟合
+#   - lr=1e-4 + cosine 衰减 → 前期快速学习，后期精细收敛
+#   - MSE loss + Flow Matching (velocity target)
+#   - 2000 步 = 500 epochs，充分训练直到 loss → 0
+#
+# 显存分析（A10G 23GB，T5+VAE-Encoder 预缓存后卸载）：
+#   静态开销 = DiT(1.2G) + VAE-Dec(0.3G) + AdamW(7.3G) + Grad(1.2G) ≈ 10 GB
+#   激活值(bs=8, grad_ckpt) ≈ 14-16 GB → 峰值 ~18-19 GB ✓（余 ~4 GB）
+#
+# Batch size 计算（3× GPU，使用 GPU 1/2/3）：
+#   effective_batch = train_batch_size(8) × grad_accum(1) × num_gpus(3) = 24
+#   steps_per_epoch = ceil(96 / 24) = 4
+#   total_epochs    = ceil(2000 / 4) = 500 epochs
+#
+# 预计耗时（3× A10G）：
+#   2000 步 + 4 次验证（含 FID）≈ ~3-4h
+#
+# 启动方式:
+#   bash train.sh overfitpixart
+#   bash train.sh overfitpixart zero2  # DeepSpeed ZeRO-2
+# ============================================================
+
+model:
+  pretrained_model_name_or_path: "PixArt-alpha/PixArt-Sigma-XL-2-1024-MS"
+  model_type: "pixart_sigma"
+  weights_dir: "/home/daiqing_tan/stable_diffusion_lora/weights"
+
+training:
+  output_dir: "./outputs/overfit_test_pixart_sigma"
+
+  num_train_steps: 2000
+  learning_rate: 1.0e-4              # 全参微调用较保守 lr，避免震荡
+  train_batch_size: 8
+  gradient_accumulation_steps: 1     # effective_batch = 8×1×3GPU = 24，steps_per_epoch = 4
+  mixed_precision: "bf16"
+  cache_latents: true
+  cache_text_embeddings: true
+
+  validation_steps: 500              # 验证 4 次（step 500, 1000, 1500, 2000）
+  save_steps: 500                    # 每 500 步保存，可对比不同阶段效果
+  keep_last_n_checkpoints: 4
+  lr_warmup_steps: 50                # 短暂热身防止初始梯度过大
+  lr_scheduler: "cosine"             # cosine 衰减，后期精细收敛
+
+  gradient_checkpointing: true
+  attention_backend: "sdpa"
+  allow_tf32: true
+  compile_model: true                # torch.compile 加速 DiT 前向/反向 ~20-40%
+  dataloader_num_workers: 2          # cached latents 为小 .pt 文件，2 workers 足够
+
+  loss_type: "mse"                   # 过拟合用 MSE 更直观观察 loss
+
+  # Flow Matching 参数
+  timestep_sampling: "uniform"
+  logit_mean: 0.0
+  logit_std: 1.0
+  scheduler_shift: 1.0
+
+data:
+  train_data_dir: "/home/daiqing_tan/stable_diffusion_lora/data/overfit_test/train"
+  resolution: 1024
+  caption: "architectural floor plan, blueprint, technical drawing"
+  use_aspect_ratio_bucketing: false
+  center_crop: false
+  random_flip: false                 # 关闭翻转，保持训练数据完全固定
+
+validation:
+  # 4 个 prompt 对应训练集前 4 张图，每次验证生成 [生成图 | 训练原图] 对比图
+  prompts:
+    - "architectural floor plan, blueprint, technical drawing"
+    - "architectural floor plan, blueprint, technical drawing"
+    - "architectural floor plan, blueprint, technical drawing"
+    - "architectural floor plan, blueprint, technical drawing"
+  negative_prompt: ""
+  num_inference_steps: 25
+  guidance_scale: 4.5                # PixArt-Sigma 推荐值
+  seed: 42
+  num_images_per_prompt: 1
+
+  compute_fid: true
+  fid:
+    num_real_images: 96                # 使用全部 96 张训练图作为真实参考
+    num_gen_images: 96                 # 生成同等数量用于对比

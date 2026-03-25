@@ -1,0 +1,91 @@
+# ============================================================
+# PixArt-Sigma 过拟合测试配置（16 张图版本, Flow Matching）
+#
+# 目的：用 16 张图片 + 固定学习率验证 Flow Matching 全参数微调能否完全拟合，
+#       loss 应在数百步内趋近 0，生成图应极度接近原图。
+#
+# Batch size 计算（4× GPU）：
+#   effective_batch = train_batch_size(4) × grad_accum(1) × num_gpus(4) = 16
+#   steps_per_epoch = ceil(16 / 16) = 1   （每步恰好遍历全部 16 张）
+#   total_epochs    = 3000 epochs
+#
+# 收敛预期（固定 lr，16 张数据）：
+#   - ~200  步：loss < 0.05
+#   - ~500  步：loss < 0.01
+#   - ~1500 步：loss < 0.001（完全记忆）
+#
+# 验证：每 500 步生成 4 张图并与对应训练原图并排对比（compare_XX.png）
+#
+# 启动方式:
+#   bash train.sh overfitpixart16img
+# ============================================================
+
+model:
+  pretrained_model_name_or_path: "PixArt-alpha/PixArt-Sigma-XL-2-1024-MS"
+  model_type: "pixart_sigma"
+  weights_dir: "/home/daiqing_tan/stable_diffusion_lora/weights"
+
+training:
+  output_dir: "./outputs/overfit_test_pixart_sigma_16img"
+
+  num_train_steps: 1200
+  learning_rate: 1.0e-4
+  train_batch_size: 4                # 4 GPU × bs4 = 16 = 数据集大小，每步正好一个 epoch
+  gradient_accumulation_steps: 1
+  mixed_precision: "bf16"
+  cache_latents: true
+  cache_text_embeddings: true
+
+  validation_steps: 300
+  save_steps: 300
+  keep_last_n_checkpoints: 6
+  lr_warmup_steps: 20
+  lr_scheduler: "constant"           # 固定学习率，过拟合更彻底
+
+  gradient_checkpointing: true
+  attention_backend: "sdpa"
+  allow_tf32: true
+  compile_model: false
+  dataloader_num_workers: 2
+
+  loss_type: "mse"
+
+  # Flow Matching 参数
+  # 过拟合测试使用 uniform 采样：DDPM→FM 迁移需要全时间步均匀覆盖，
+  # logit_normal 对极端 t（纯噪声/纯干净区域）训练信号不足，导致 t2i 推理起始步失败
+  timestep_sampling: "uniform"
+  logit_mean: 0.0
+  logit_std: 1.0
+  scheduler_shift: 1.0
+
+data:
+  train_data_dir: "/home/daiqing_tan/stable_diffusion_lora/data/overfit_test_16img/train"
+  resolution: 1024
+  caption: "architectural floor plan, blueprint, technical drawing"
+  use_aspect_ratio_bucketing: false
+  center_crop: false
+  random_flip: false
+
+validation:
+  # 4 个 prompt 对应训练集前 4 张图，每次验证生成 [生成图 | 训练原图] 对比图
+  prompts:
+    - "architectural floor plan, blueprint, technical drawing"
+    - "architectural floor plan, blueprint, technical drawing"
+    - "architectural floor plan, blueprint, technical drawing"
+    - "architectural floor plan, blueprint, technical drawing"
+  negative_prompt: ""
+  num_inference_steps: 25
+  guidance_scale: 4.5
+  seed: 42
+  num_images_per_prompt: 1
+  # img2img 模式：对训练原图加多级噪声后让模型去噪，直接验证记忆深度
+  # 列表中每个值各生成一组，保存为 s0.3_* / s0.5_* / s0.7_*
+  #   0.3 = 轻度：保留 70% 原图结构，模型稍记忆即可复原
+  #   0.5 = 中度：保留 50%，需要较强记忆才能复原
+  #   0.7 = 强度：仅保留 30%，完全过拟合才能复原
+  img2img_strength: [0.3,0.5, 0.7]
+
+  compute_fid: true
+  fid:
+    num_real_images: 16              # 使用全部 16 张训练图作为真实参考
+    num_gen_images: 16               # 生成同等数量用于对比

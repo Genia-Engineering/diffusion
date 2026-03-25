@@ -1,0 +1,78 @@
+# ============================================================
+# PixArt-Sigma 全参数微调配置 — 建筑平面图（正式训练）
+# 训练范式: Rectified Flow (Flow Matching, sigma 参数化)
+#   x_t = (1-sigma)*x_1 + sigma*x_0,  target = x_0 - x_1 (sigma velocity)
+# 硬件: 4× NVIDIA A10G (23GB each)
+# 数据集: ~3400 张 1024×1024 PNG，无 caption
+#
+# 显存估算 (per GPU, 标准 DDP, bf16, gc=ON):
+#   cache_latents + cache_text_embeddings → VAE & T5-XXL 不占训练显存
+#   Transformer(bf16) ~1.2GB + Adam优化器 ~4.8GB + 梯度 ~1.2GB = 7.2GB 固定
+#   激活值(梯度检查点, batch=8, seq=4096) ~9.6GB → 合计 ~16.8GB，低于 23GB
+#
+# 步数推算:
+#   train_batch_size=8 per GPU, grad_accum=4, 4GPUs → effective_batch=128
+#   每 epoch 优化器步数 = ⌈3400 ÷ 128⌉ = 27 步
+#   60 epoch = 27 × 60 = 1620 步
+#
+# 注意：ZeRO-2 下 DeepSpeed 激活值退化为 fp32，反而 OOM，请勿使用。
+#
+# 启动方式:
+#   bash train.sh pixart             # 标准多卡（推荐）
+#   bash train.sh pixart resume      # 恢复训练
+# ============================================================
+
+model:
+  pretrained_model_name_or_path: "PixArt-alpha/PixArt-Sigma-XL-2-1024-MS"
+  model_type: "pixart_sigma"
+  weights_dir: "/home/daiqing_tan/stable_diffusion_lora/weights"
+
+training:
+  output_dir: "./outputs/pixart_sigma_floorplan"
+  num_train_steps: 1800              # 60 epoch (3400 images, effective_batch=128, 27 step/epoch)
+  learning_rate: 2.0e-5              # 全参数微调需要较低学习率
+  train_batch_size: 8                # 每 GPU 8 个样本（gc=ON 时实测 ~12-14GB，安全）
+  gradient_accumulation_steps: 4     # 累积 4 步 → effective batch = 8×4GPU×4accum = 128
+  mixed_precision: "bf16"
+  cache_latents: true
+  cache_text_embeddings: true
+  latent_cache_batch_size: 8         # VAE 预计算 batch size（4 卡并行，每卡 8 张 1024 分辨率）
+
+  validation_steps: 300              # 每 270 步验证一次（约每 10 epoch）
+  save_steps: 300                    # 每 10 epoch 保存一次，共 6 个 checkpoint
+  keep_last_n_checkpoints: 6
+  lr_warmup_steps: 180               # 前 6 epoch warmup (~10% 总步数)
+  gradient_checkpointing: true       # 开启后激活值显存大幅下降（batch=8 约 12-14GB）
+  compile_model: false               # autotune 第一步峰值显存冲至 ~22GB 导致 OOM，保持关闭
+  loss_type: "mse"
+
+  # Flow Matching 参数
+  # DDPM→FM 迁移微调建议先用 uniform 确保全时间步覆盖；
+  # 模型适应 FM 后可切换 logit_normal 聚焦中间时间步提升质量
+  timestep_sampling: "uniform"       # "uniform" 或 "logit_normal"
+  logit_mean: 0.0                    # logit-normal 分布均值（仅 logit_normal 时生效）
+  logit_std: 1.0                     # logit-normal 分布标准差（仅 logit_normal 时生效）
+  scheduler_shift: 1.0               # FlowMatchEulerDiscreteScheduler sigma shift
+
+data:
+  train_data_dir: "/home/daiqing_tan/stable_diffusion_lora/data/data/llm_1024/floor"
+  resolution: 1024
+  caption: "architectural floor plan, blueprint, technical drawing"
+
+validation:
+  prompts:
+    - "architectural floor plan, blueprint, technical drawing"
+  negative_prompt: ""
+  num_inference_steps: 50
+  guidance_scale: 4.5                # PixArt-Sigma 推荐 guidance_scale=4.5
+  seed: 42
+  num_images_per_prompt: 4
+  img2img_strength: [0.3, 0.5, 0.7]
+
+  compute_fid: true
+  fid:
+    num_real_images: 512
+    num_gen_images: 512
+    model_name: "dinov2_vitb14"
+    batch_size: 8                   # FID pipeline 推理 batch size（无梯度/无激活保留，验证期间剩余~17GB，16张无压力）
+    real_features_cache: "./outputs/pixart_sigma_floorplan/fid_real_features.npz"

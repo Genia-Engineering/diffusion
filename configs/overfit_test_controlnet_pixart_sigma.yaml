@@ -1,0 +1,73 @@
+# ============================================================
+# PixArt-Sigma ControlNet 过拟合测试配置
+#
+# 目的：用 4 张图片验证 PixArt ControlNet adapter 是否能完全拟合训练数据，
+#       loss 应稳步下降趋近 0，生成图应越来越接近原图。
+#
+# 数据准备（首次运行前执行一次）：
+#   python scripts/prepare_overfit_data.py
+#   → 随机采样 4 对图片到 data/overfit_test/{train,conditioning}/
+#
+# 预计耗时（4× A10G）：
+#   800 步 × ~3s/step ≈ ~40 min
+#   触发 8 次验证（每 100 步）
+# ============================================================
+
+model:
+  pretrained_model_name_or_path: "PixArt-alpha/PixArt-Sigma-XL-2-1024-MS"
+  model_type: "pixart_sigma"
+  weights_dir: "/home/daiqing_tan/stable_diffusion_lora/weights"
+
+controlnet:
+  num_layers: 13
+  conditioning_mode: "vae"            # "vae" | "cnn_encoder"
+  conditioning_type: "precomputed"
+
+training:
+  output_dir: "./outputs/overfit_test_controlnet_pixart_sigma"
+  num_train_steps: 800
+  learning_rate: 1.0e-4
+  train_batch_size: 1
+  gradient_accumulation_steps: 1      # effective_batch = 1×4GPU = 4
+  mixed_precision: "bf16"
+  cache_latents: true
+  cache_text_embeddings: true
+  latent_cache_batch_size: 4
+
+  validation_steps: 100               # 频繁验证观察收敛
+  save_steps: 200
+  keep_last_n_checkpoints: 4
+  lr_warmup_steps: 0
+  lr_scheduler: "constant"
+
+  gradient_checkpointing: true
+  attention_backend: "sdpa"
+  allow_tf32: true
+  dataloader_num_workers: 0
+
+  loss_type: "mse"
+  noise_offset: 0.0
+  min_snr_gamma: 0.0
+
+data:
+  train_data_dir: "/home/daiqing_tan/stable_diffusion_lora/data/overfit_test/train"
+  conditioning_data_dir: "/home/daiqing_tan/stable_diffusion_lora/data/overfit_test/conditioning"
+  resolution: 1024
+  caption: "architectural floor plan, blueprint, technical drawing"
+  use_aspect_ratio_bucketing: false
+  center_crop: false
+  random_flip: false
+  t5_max_length: 300
+
+validation:
+  prompts:
+    - "architectural floor plan, blueprint, technical drawing"
+    - "architectural floor plan, blueprint, technical drawing"
+    - "architectural floor plan, blueprint, technical drawing"
+    - "architectural floor plan, blueprint, technical drawing"
+  negative_prompt: ""
+  num_inference_steps: 20
+  guidance_scale: 4.5
+  seed: 42
+  num_images_per_prompt: 1
+  compute_fid: false

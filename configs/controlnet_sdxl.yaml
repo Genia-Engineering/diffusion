@@ -1,0 +1,74 @@
+# ============================================================
+# SDXL ControlNet 训练配置
+# 数据集 ~3400，batch_size=2，grad_accum=4
+# 425 opt_step/epoch × 40 epoch = 17000 step
+#
+# 显存估算 (per GPU, A10G 23GB):
+#   UNet(bf16) ~5.2GB + VAE(bf32) ~0.3GB + ControlNet(bf16) ~5GB
+#   + TE1-CLIP-L(frozen) ~0.25GB + TE2-OpenCLIP-G(frozen) ~1.4GB
+#   + Activations(梯度检查点+SDPA) ~8GB ≈ 20-21GB
+# ============================================================
+
+model:
+  pretrained_model_name_or_path: "stabilityai/stable-diffusion-xl-base-1.0"
+  model_type: "sdxl"
+  weights_dir: "/home/daiqing_tan/stable_diffusion_lora/weights"
+  merged_unet_path: "/home/daiqing_tan/stable_diffusion_lora/outputs/lora_sdxl_floorplan/merged_step_000810"  # LoRA 融合后的完整模型目录（含 unet/ 子目录）
+
+controlnet:
+  conditioning_type: "precomputed"   # 使用预提取的 controlnet_color 条件图像
+  conditioning_channels: 3
+
+  # ── 灵活冻结策略（均可组合，互不冲突） ──
+  # mid_block 必须可训练：负责编码颜色掩码的全局空间结构（房间布局、墙体走向等）
+  # cross_attn 冻结：使用固定 caption，语义对齐无需调整；且冻结可减少 ~1.5GB DDP 梯度 buffer，防 OOM
+  freeze_cross_attention: true
+  freeze_down_blocks: []             # 冻结指定下采样块索引 (0-3 中任选)，如 [0, 1]
+  freeze_mid_block: false
+
+training:
+  output_dir: "./outputs/controlnet_sdxl"
+  num_train_steps: 17000            # 40 epochs (3400/2/4=425 opt_step/epoch × 40)
+  learning_rate: 1.0e-5
+  train_batch_size: 2
+  gradient_accumulation_steps: 4    # effective batch = 8
+  mixed_precision: "bf16"
+  cache_latents: true             # 预计算 VAE latent，卸载 encoder 节省显存
+  cache_text_embeddings: true     # 预计算文本嵌入，卸载文本编码器节省显存
+
+  validation_steps: 850           # 每 2 epoch 验证一次 (425 × 2)，共 20 次
+  save_steps: 2125                # 每 5 epoch 保存一次 (425 × 5)，共 8 次 + 结束强制 1 次
+  keep_last_n_checkpoints: 6      # 保留最近 6 个，覆盖最后 30 epoch
+  lr_warmup_steps: 500            # ~3% of 17000
+
+  gradient_checkpointing: true
+  attention_backend: "sdpa"         # "sdpa" (默认, PyTorch 原生) | "xformers"
+  enable_channels_last: true        # channels_last 内存格式加速 CNN 层
+  allow_tf32: true                  # Ampere+ GPU (A10G/A100) float32 加速
+  dataloader_num_workers: 4
+
+  # ── 损失函数 ──
+  loss_type: "huber"                # "mse" | "huber"
+  huber_delta: 0.1                  # Huber loss delta 参数
+  noise_offset: 0.1                 # 噪声偏移，改善极亮/极暗区域
+  min_snr_gamma: 5.0                # Min-SNR 加权 gamma
+
+data:
+  train_data_dir: "/home/daiqing_tan/stable_diffusion_lora/data/data/size_1024/floor"
+  conditioning_data_dir: "/home/daiqing_tan/stable_diffusion_lora/data/data/size_1024_controlnet/floor"
+  resolution: 1024
+  caption: "architectural floor plan, blueprint, technical drawing"
+  use_aspect_ratio_bucketing: true
+  center_crop: false
+  random_flip: true
+
+validation:
+  prompts:
+    - "architectural floor plan, blueprint, technical drawing"
+    - "architectural floor plan, blueprint, technical drawing"
+    - "architectural floor plan, blueprint, technical drawing"
+    - "architectural floor plan, blueprint, technical drawing"
+  negative_prompt: "blurry, noisy, low quality, photo"
+  num_inference_steps: 25
+  guidance_scale: 7.5
+  seed: 42

@@ -1,0 +1,65 @@
+CUDA_VISIBLE_DEVICES=0,1   accelerate launch     --config_file configs/accelerate_2gpu.yaml     scripts/train_lora.py     --config configs/lora_sd15_floorplan.yaml
+tensorboard --logdir /home/daiqing_tan/stable_diffusion_lora/outputs/tensorboard --port 6006
+
+
+mkdir -p /home/daiqing_tan/stable_diffusion_lora/logs && \
+CUDA_VISIBLE_DEVICES=0,1 nohup accelerate launch \
+    --config_file configs/accelerate_2gpu.yaml \
+    scripts/train_lora.py \
+    --config configs/lora_sd15_floorplan.yaml \
+    > /home/daiqing_tan/stable_diffusion_lora/logs/train.log 2>&1 &
+echo "Training PID: $!"
+
+tail -f /home/daiqing_tan/stable_diffusion_lora/logs/train.log
+
+
+
+
+nohup bash -c '
+sleep 27000
+echo "[$(date)] 即将杀掉以下 GPU 进程："
+nvidia-smi --query-compute-apps=pid,used_memory,name --format=csv,noheader
+nvidia-smi --query-compute-apps=pid --format=csv,noheader | xargs -r kill -9
+sleep 5
+echo "[$(date)] 开始训练..."
+bash train.sh lora sdxl --config configs/lora_sdxl.yaml
+' > train_output.log 2>&1 &
+echo "任务 PID: $!"
+
+
+
+
+python scripts/merge_lora_weights.py \
+    --base_model stabilityai/stable-diffusion-xl-base-1.0 \
+    --lora_checkpoint outputs/lora_sdxl_floorplan/checkpoints/step_000810 \
+    --output_dir outputs/lora_sdxl_floorplan/merged_step_000810 \
+    --model_type sdxl \
+    --lora_rank 32 \
+    --lora_alpha 32 \
+    --lora_target_modules to_q to_k to_v to_out.0 ff.net.0.proj ff.net.2 \
+    --weights_dir /home/daiqing_tan/stable_diffusion_lora/weights
+
+
+
+
+# ControlNet step_017000（最终权重）对 4 张验证条件图推理，自动生成三栏对比图
+# 可用 checkpoints: step_006375 / step_008500 / step_010625 / step_012750 / step_014875 / step_017000
+CUDA_VISIBLE_DEVICES=0 python scripts/predict.py \
+    --model_type sdxl \
+    --merged_model_path outputs/lora_sdxl_floorplan/merged_step_000810 \
+    --controlnet_paths outputs/controlnet_sdxl/checkpoints/step_017000/controlnet \
+    --control_images \
+        "data/val_conditioning_images/20250401_T (54)_per_floor_per_layer_b1_controlnet_color_1024.png" \
+        "data/val_conditioning_images/20250212_autocadfiles-2060-housing_trade_plan_detail_dwg_file._28082021045533_VIVIENDA_COMERCIO_t3_per_floor_per_layer_f1_controlnet_color_1024.png" \
+        "data/val_conditioning_images/20250210_autocadfiles-1181-multi-family_residential_building_ground,_first_floor_and_second_floor_distribution_plan_details_dwg_file_06122018125755_VIVENDA_COMERCIO_t3_per_floor_per_layer_f1_controlnet_color_1024.png" \
+        "data/val_conditioning_images/20250415_Y (79)_per_floor_per_layer_f2_controlnet_color_1024.png" \
+    --prompt \
+        "architectural floor plan, blueprint, technical drawing" \
+        "architectural floor plan, blueprint, technical drawing" \
+        "architectural floor plan, blueprint, technical drawing" \
+        "architectural floor plan, blueprint, technical drawing" \
+    --controlnet_scales 1.0 \
+    --num_images 1 \
+    --num_inference_steps 25 \
+    --seed 42 \
+    --output_dir outputs/predict/controlnet_step017000_scale1.0

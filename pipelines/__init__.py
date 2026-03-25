@@ -1,0 +1,1 @@
+from .pixart_controlnet_pipeline import PixArtControlNetPipeline

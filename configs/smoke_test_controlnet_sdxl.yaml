@@ -1,0 +1,78 @@
+# ============================================================
+# SDXL ControlNet 快速冒烟测试配置
+#
+# 目的：用极少步数跑完「训练 → 验证（样本图）→ 继续训练」
+#       完整闭环，确认 ControlNet 训练流程正常运行。
+#
+# 预计耗时（4× A10G）：
+#   训练 20 步 × ~40s/step ÷ 8(grad_accum) ≈ ~3 min
+#   验证（样本图 1 张，5 步推理）            ≈ ~15 s
+#   总计 < 10 分钟，触发 2 次完整验证
+#
+# 关键验证点：
+#   1. ControlNet 条件图像正确加载与编码
+#   2. 验证后所有卡通过 wait_for_everyone() 正常恢复训练
+#   3. 无 NCCL AllReduce 超时
+#   4. 条件控制输出图像正确保存
+# ============================================================
+
+model:
+  pretrained_model_name_or_path: "stabilityai/stable-diffusion-xl-base-1.0"
+  model_type: "sdxl"
+  weights_dir: "/home/daiqing_tan/stable_diffusion_lora/weights"
+  merged_unet_path: "/home/daiqing_tan/stable_diffusion_lora/outputs/lora_sdxl_floorplan/merged_step_000810"  # LoRA 融合后的完整模型（如不存在可注释掉）
+
+controlnet:
+  conditioning_type: "precomputed"   # 使用预提取的 controlnet_color 条件图像
+  conditioning_channels: 3
+
+  freeze_cross_attention: true   # 冻结以减少 DDP 梯度 buffer（cross_attn 占 ~30% 参数），防 OOM
+  freeze_down_blocks: []
+  freeze_mid_block: false        # mid_block 必须可训练，否则无法学习颜色掩码的全局结构
+
+training:
+  output_dir: "./outputs/smoke_test_controlnet_sdxl"
+
+  num_train_steps: 20              # 只跑 20 步，触发 2 次验证（step 10 和 20）
+  learning_rate: 1.0e-5
+  train_batch_size: 1               # 每 GPU 1 张，降低显存压力
+  gradient_accumulation_steps: 2  # effective_batch = 1×4GPU×2 = 8
+  mixed_precision: "bf16"
+  cache_latents: true             # 预计算 VAE latent，卸载 encoder 节省显存
+  cache_text_embeddings: true     # 预计算文本嵌入，卸载文本编码器节省显存
+
+  validation_steps: 10             # 每 10 步触发一次，共触发 2 次
+  save_steps: 10
+  keep_last_n_checkpoints: 2
+  lr_warmup_steps: 3               # 极短热身，不影响功能验证
+
+  gradient_checkpointing: true
+  attention_backend: "sdpa"
+  enable_channels_last: true
+  allow_tf32: true
+  dataloader_num_workers: 2
+
+  loss_type: "huber"               # 与正式训练保持一致，测试 Huber loss 路径
+  huber_delta: 0.1
+  noise_offset: 0.1
+  min_snr_gamma: 5.0
+
+data:
+  train_data_dir: "/home/daiqing_tan/stable_diffusion_lora/data/data/size_1024/floor"
+  conditioning_data_dir: "/home/daiqing_tan/stable_diffusion_lora/data/data/size_1024_controlnet/floor"
+  resolution: 1024
+  caption: "architectural floor plan, blueprint, technical drawing"
+  use_aspect_ratio_bucketing: false  # 冒烟测试关闭 bucketing，加快数据加载
+  center_crop: false
+  random_flip: false
+
+validation:
+  prompts:
+    - "architectural floor plan, blueprint, technical drawing"
+  negative_prompt: "blurry, noisy, low quality, photo"
+  num_inference_steps: 5           # 5 步推理（质量差但速度快，只测流程）
+  guidance_scale: 7.5
+  seed: 42
+  num_images_per_prompt: 1         # 样本图每次只生成 1 张
+
+  compute_fid: false               # 冒烟测试不计算 FID，节省时间

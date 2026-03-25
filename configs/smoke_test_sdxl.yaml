@@ -1,0 +1,76 @@
+# ============================================================
+# SDXL LoRA 快速冒烟测试配置
+#
+# 目的：用极少步数跑完「训练 → 验证（样本图）→ FID（分布式）→ 继续训练」
+#       完整闭环，确认修复后不再触发 NCCL 超时崩溃。
+#
+# 预计耗时（4× A10G）：
+#   训练 20 步 × ~35s/step ÷ 8(grad_accum) ≈ ~3 min
+#   验证（样本图 1 张，5 步推理）      ≈ ~10 s
+#   FID（8 张 ÷ 4 卡 = 2 张/卡，5步）  ≈ ~20 s
+#   总计 < 10 分钟，触发 2 次完整验证
+#
+# 关键验证点：
+#   1. 验证后所有卡通过 wait_for_everyone() 正常恢复训练
+#   2. 4 卡各自生成 2 张 FID 图，gather 后 Rank 0 完成计算
+#   3. 无 NCCL AllReduce 超时
+# ============================================================
+
+model:
+  pretrained_model_name_or_path: "stabilityai/stable-diffusion-xl-base-1.0"
+  model_type: "sdxl"
+  weights_dir: "/home/daiqing_tan/stable_diffusion_lora/weights"
+
+lora:
+  rank: 32
+  alpha: 32
+  target_modules:
+    - "to_q"
+    - "to_k"
+    - "to_v"
+    - "to_out.0"
+    - "ff.net.0.proj"
+    - "ff.net.2"
+  train_text_encoder: false
+  train_text_encoder_2: false
+
+training:
+  output_dir: "./outputs/smoke_test_sdxl"
+
+  num_train_steps: 20            # 只跑 20 步，触发 2 次验证（step 10 和 20）
+  learning_rate: 1.0e-4
+  train_batch_size: 1            # 每 GPU 1 张，降低显存压力，加快单步速度
+  gradient_accumulation_steps: 2 # effective_batch = 1×4GPU×2 = 8
+  mixed_precision: "bf16"
+  cache_latents: true             # 预计算 VAE latent，卸载 encoder 节省显存
+
+  validation_steps: 10           # 每 10 步触发一次，共触发 2 次
+  save_steps: 10
+  keep_last_n_checkpoints: 2
+  lr_warmup_steps: 3             # 极短热身，不影响功能验证
+
+  loss_type: "huber"             # 与正式训练保持一致，测试 Huber loss 路径
+  huber_delta: 0.1
+  noise_offset: 0.1
+  min_snr_gamma: 5.0
+
+data:
+  train_data_dir: "/home/daiqing_tan/stable_diffusion_lora/data/data/size_1024/floor"
+  resolution: 1024
+  caption: "architectural floor plan, blueprint, technical drawing"
+
+validation:
+  prompts:
+    - "architectural floor plan, blueprint, technical drawing"
+  negative_prompt: "blurry, noisy, low quality"
+  num_inference_steps: 5         # 5 步推理（质量差但速度快，只测流程）
+  guidance_scale: 7.5
+  seed: 42
+  num_images_per_prompt: 1       # 样本图每次只生成 1 张
+
+  compute_fid: true
+  fid:
+    num_real_images: 16          # 16 张真实图够算统计量（测试用）
+    num_gen_images: 8            # 4 卡各生成 2 张，合计 8 张（验证分布式路径）
+    feature_dim: 2048
+    real_features_cache: "./outputs/smoke_test_sdxl/fid_real_features.pt"

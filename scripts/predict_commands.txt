@@ -1,0 +1,155 @@
+# =============================================================
+# predict.py 推理指令参考
+# 用法: 复制所需命令到终端执行（在项目根目录下运行）
+# =============================================================
+
+
+# ─────────────────────────────────────────────────────────────
+#  PixArt-Sigma  t2i（纯文生图）
+# ─────────────────────────────────────────────────────────────
+
+# 基础 t2i：使用最新 checkpoint
+python scripts/predict.py \
+    --model_type pixart_sigma \
+    --merged_model_path ./outputs/pixart_sigma_floorplan/checkpoints/step_002160 \
+    --prompt "architectural floor plan, blueprint, technical drawing" \
+    --num_images 4 \
+    --seed 42 \
+    --output_dir ./outputs/predict/pixart_t2i
+
+# t2i 多 prompt 对比
+python scripts/predict.py \
+    --model_type pixart_sigma \
+    --merged_model_path ./outputs/pixart_sigma_floorplan/checkpoints/step_002160 \
+    --prompt \
+        "architectural floor plan, blueprint, technical drawing" \
+        "residential house floor plan, detailed room layout, dimensions" \
+        "modern apartment floor plan, open concept, minimalist" \
+    --num_images 2 \
+    --output_dir ./outputs/predict/pixart_t2i_multi_prompt
+
+# t2i 调参：更高 guidance_scale + 更多步数
+# （PixArt-Sigma 自动使用 guidance_scale=4.5 + scheduler=dpm，此处手动覆盖演示）
+python scripts/predict.py \
+    --model_type pixart_sigma \
+    --merged_model_path ./outputs/pixart_sigma_floorplan/checkpoints/step_002160 \
+    --prompt "architectural floor plan, blueprint, technical drawing" \
+    --guidance_scale 5.0 \
+    --num_inference_steps 50 \
+    --num_images 4 \
+    --output_dir ./outputs/predict/pixart_t2i_highcfg
+
+# t2i 使用 Euler 调度器
+python scripts/predict.py \
+    --model_type pixart_sigma \
+    --merged_model_path ./outputs/pixart_sigma_floorplan/checkpoints/step_002160 \
+    --prompt "architectural floor plan, blueprint, technical drawing" \
+    --scheduler euler \
+    --num_images 4 \
+    --output_dir ./outputs/predict/pixart_t2i_euler
+
+
+# ─────────────────────────────────────────────────────────────
+#  PixArt-Sigma  img2img（参考图引导生成）
+# ─────────────────────────────────────────────────────────────
+
+# img2img 基础：单张参考图，strength=0.5（中等偏离）
+python scripts/predict.py \
+    --model_type pixart_sigma \
+    --merged_model_path ./outputs/pixart_sigma_floorplan/checkpoints/step_002160 \
+    --input_images "data/data/size_1024/floor/20250206_autocadfiles-1000-local_hospital_elevation,_section,_plan_and_auto-cad_drawing_details_dwg_file_19022019114157_CASA_DE_SALUD_PLANOS_GC_ARQUITECTONICOS_Y_ESTRUCTURALES_t3_per_floor_per_layer_f1___total__1024.png" \
+    --strength 0.5 \
+    --prompt "architectural floor plan, blueprint, technical drawing" \
+    --num_images 4 \
+    --output_dir ./outputs/predict/pixart_img2img_s0.5
+
+# img2img 低 strength（强保留原图结构）
+python scripts/predict.py \
+    --model_type pixart_sigma \
+    --merged_model_path ./outputs/pixart_sigma_floorplan/checkpoints/step_002160 \
+    --input_images "data/data/size_1024/floor/20250206_autocadfiles-1000-local_hospital_elevation,_section,_plan_and_auto-cad_drawing_details_dwg_file_19022019114157_CASA_DE_SALUD_PLANOS_GC_ARQUITECTONICOS_Y_ESTRUCTURALES_t3_per_floor_per_layer_f1___total__1024.png" \
+    --strength 0.3 \
+    --prompt "architectural floor plan, blueprint, technical drawing" \
+    --num_images 4 \
+    --output_dir ./outputs/predict/pixart_img2img_s0.3
+
+# img2img 高 strength（大幅偏离原图，接近 t2i）
+python scripts/predict.py \
+    --model_type pixart_sigma \
+    --merged_model_path ./outputs/pixart_sigma_floorplan/checkpoints/step_002160 \
+    --input_images "data/data/size_1024/floor/20250206_autocadfiles-1000-local_hospital_elevation,_section,_plan_and_auto-cad_drawing_details_dwg_file_19022019114157_CASA_DE_SALUD_PLANOS_GC_ARQUITECTONICOS_Y_ESTRUCTURALES_t3_per_floor_per_layer_f1___total__1024.png" \
+    --strength 0.8 \
+    --prompt "architectural floor plan, blueprint, technical drawing" \
+    --num_images 4 \
+    --output_dir ./outputs/predict/pixart_img2img_s0.8
+
+
+# ─────────────────────────────────────────────────────────────
+#  SDXL  t2i（纯文生图）
+# ─────────────────────────────────────────────────────────────
+
+# SDXL merged 模型 t2i
+python scripts/predict.py \
+    --model_type sdxl \
+    --merged_model_path ./outputs/lora_sdxl_floorplan/merged_step_000810 \
+    --prompt "architectural floor plan, blueprint, technical drawing" \
+    --num_images 4 \
+    --output_dir ./outputs/predict/sdxl_t2i
+
+# SDXL LoRA delta t2i
+python scripts/predict.py \
+    --model_type sdxl \
+    --lora_checkpoint ./outputs/lora_sdxl_floorplan/checkpoints/step_000810 \
+    --prompt "architectural floor plan, blueprint, technical drawing" \
+    --num_images 4 \
+    --output_dir ./outputs/predict/sdxl_lora_t2i
+
+
+# ─────────────────────────────────────────────────────────────
+#  SDXL  img2img
+# ─────────────────────────────────────────────────────────────
+
+# SDXL img2img
+python scripts/predict.py \
+    --model_type sdxl \
+    --merged_model_path ./outputs/lora_sdxl_floorplan/merged_step_000810 \
+    --input_images "data/data/size_1024/floor/20250206_autocadfiles-1000-local_hospital_elevation,_section,_plan_and_auto-cad_drawing_details_dwg_file_19022019114157_CASA_DE_SALUD_PLANOS_GC_ARQUITECTONICOS_Y_ESTRUCTURALES_t3_per_floor_per_layer_f1___total__1024.png" \
+    --strength 0.5 \
+    --prompt "architectural floor plan, blueprint, technical drawing" \
+    --num_images 4 \
+    --output_dir ./outputs/predict/sdxl_img2img_s0.5
+
+
+# ─────────────────────────────────────────────────────────────
+#  SDXL  ControlNet
+# ─────────────────────────────────────────────────────────────
+
+# SDXL + merged + ControlNet（逐 prompt 条件图模式）
+python scripts/predict.py \
+    --model_type sdxl \
+    --merged_model_path ./outputs/lora_sdxl_floorplan/merged_step_000810 \
+    --controlnet_paths ./outputs/controlnet_sdxl/checkpoints/step_017000/controlnet \
+    --control_images \
+        "data/val_conditioning_images/20250401_T (54)_per_floor_per_layer_b1_controlnet_color_1024.png" \
+        "data/val_conditioning_images/20250212_autocadfiles-2060-housing_trade_plan_detail_dwg_file._28082021045533_VIVIENDA_COMERCIO_t3_per_floor_per_layer_f1_controlnet_color_1024.png" \
+        "data/val_conditioning_images/20250210_autocadfiles-1181-multi-family_residential_building_ground,_first_floor_and_second_floor_distribution_plan_details_dwg_file_06122018125755_VIVENDA_COMERCIO_t3_per_floor_per_layer_f1_controlnet_color_1024.png" \
+        "data/val_conditioning_images/20250415_Y (79)_per_floor_per_layer_f2_controlnet_color_1024.png" \
+    --prompt \
+        "architectural floor plan, blueprint, technical drawing" \
+        "architectural floor plan, blueprint, technical drawing" \
+        "architectural floor plan, blueprint, technical drawing" \
+        "architectural floor plan, blueprint, technical drawing" \
+    --controlnet_scales 0.7 \
+    --num_images 1 \
+    --output_dir ./outputs/predict/sdxl_controlnet
+
+
+# ─────────────────────────────────────────────────────────────
+#  指定 GPU / 精度 / 其他选项（适用于所有上述命令）
+# ─────────────────────────────────────────────────────────────
+#
+#  --gpu 0                  # 指定第 0 号 GPU
+#  --dtype fp16             # 使用 fp16 精度（显存更少）
+#  --scheduler euler        # 切换调度器: euler / dpm / ddpm / dpm_sde_karras
+#  --seed -1                # 随机种子
+#  --negative_prompt "..."  # 自定义负提示词

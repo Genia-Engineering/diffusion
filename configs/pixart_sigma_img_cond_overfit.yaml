@@ -1,0 +1,78 @@
+# ============================================================
+# PixArt-Sigma 图像条件微调 — 过拟合测试 (32 张图片)
+#
+# 目的: 验证训练流程正确性。如果模型能在 32 张图片上过拟合
+#       (loss 持续下降至接近 0, 生成图近似训练图), 说明:
+#         ✓ 数据管线正确
+#         ✓ 模型前向/反向传播正确
+#         ✓ 条件编码器 → Transformer 的连接正确
+#         ✓ Flow Matching 损失计算正确
+#
+# 硬件: 4× NVIDIA A10G (23GB each)
+# 步数推算:
+#   train_batch_size=8, grad_accum=1, 4GPUs → effective_batch=32
+#   每 epoch ≈ 1 步 (32张全部覆盖)
+#   1000 步 = 1000 epoch → 充分过拟合
+#
+# 启动方式:
+#   bash train.sh pixart_ic_overfit
+# ============================================================
+
+model:
+  pretrained_model_name_or_path: "PixArt-alpha/PixArt-Sigma-XL-2-1024-MS"
+  model_type: "pixart_sigma"
+  weights_dir: "/home/daiqing_tan/stable_diffusion_lora/weights"
+
+  image_encoder:
+    type: "vae"
+    dinov2_model: "facebook/dinov2-large"
+    dinov2_resolution: 518
+    projection_dim: 4096
+    vae_hidden_channels: [512, 2048]
+
+training:
+  output_dir: "./outputs/pixart_img_cond_overfit"
+  num_train_steps: 1000
+  learning_rate: 1.0e-4
+  train_batch_size: 8
+  gradient_accumulation_steps: 1
+  mixed_precision: "bf16"
+  cache_latents: true
+  cache_cond_features: true
+  latent_cache_batch_size: 4
+  cond_dropout_prob: 0.0                    # 过拟合测试: 禁用 CFG dropout
+
+  init_dit_randomly: true                     # 不加载预训练 DiT 权重，随机初始化
+
+  projector_warmup_steps: 0                  # 从第一步就联合训练
+  projector_warmup_lr: 0                     # 不使用 warmup
+  projector_lr: 5.0e-4                       # Projector 独立学习率 (5× transformer LR)
+
+  validation_steps: 100
+  save_steps: 500
+  keep_last_n_checkpoints: 3
+  lr_warmup_steps: 50
+  gradient_checkpointing: true
+  compile_model: false
+  loss_type: "mse"
+  max_grad_norm: 1.0
+
+  use_ema: false                            # 过拟合测试不需要 EMA
+
+  timestep_sampling: "logit_normal"
+  logit_mean: 0.0
+  logit_std: 1.0
+  scheduler_shift: 1.0
+
+data:
+  train_data_dir: "/home/daiqing_tan/stable_diffusion_lora/data/data/size_1024_overfit/floor"
+  conditioning_data_dir: "/home/daiqing_tan/stable_diffusion_lora/data/data/size_1024_controlnet_overfit/floor"
+  resolution: 1024
+
+validation:
+  num_val_images: 4
+  num_inference_steps: 50
+  guidance_scale: 4.5
+  seed: 42
+
+  compute_fid: false                        # 过拟合测试不需要 FID

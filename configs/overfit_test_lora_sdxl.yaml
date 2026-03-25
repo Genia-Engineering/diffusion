@@ -1,0 +1,92 @@
+# ============================================================
+# SDXL LoRA 过拟合测试配置
+#
+# 目的：用 4 张图片验证 LoRA 是否能完全拟合训练数据，
+#       loss 应稳步下降趋近 0，生成图应越来越接近原图。
+#
+# 与 controlnet overfit 的关键区别：
+#   overfit (controlnet) → 验证结构控制学习能力
+#   overfitlora (lora)   → 验证 LoRA 风格/内容学习能力（无条件控制）
+#
+# 数据准备（首次运行前执行一次，与 controlnet overfit 共用）：
+#   python scripts/prepare_overfit_data.py
+#   → 随机采样 4 张图片到 data/overfit_test/train/
+#
+# 过拟合 LoRA 参数选择原则：
+#   - rank 尽量大（128）→ 表达能力最强，最容易拟合
+#   - lr 高（5e-4）→ 加速收敛，无需担心泛化
+#   - 关闭所有正则化（noise_offset=0, min_snr=0）
+#   - MSE loss → 过拟合时比 Huber 更直观
+#   - constant lr，无 warmup
+#
+# 预计耗时（4× A10G）：
+#   500 步 × ~2s/step ≈ ~17 min
+#   触发 5 次验证（每 100 步），可观察收敛曲线
+# ============================================================
+
+model:
+  pretrained_model_name_or_path: "stabilityai/stable-diffusion-xl-base-1.0"
+  model_type: "sdxl"
+  weights_dir: "/home/daiqing_tan/stable_diffusion_lora/weights"
+
+lora:
+  rank: 128                          # 最大秩，最大化表达能力以便过拟合
+  alpha: 128                         # alpha = rank，缩放系数为 1.0
+  target_modules:
+    - "to_q"
+    - "to_k"
+    - "to_v"
+    - "to_out.0"
+    - "ff.net.0.proj"
+    - "ff.net.2"
+  train_text_encoder: false
+  train_text_encoder_2: false
+
+training:
+  output_dir: "./outputs/overfit_test_lora_sdxl"
+
+  num_train_steps: 500
+  learning_rate: 5.0e-4              # 过拟合无需保守，高 lr 加速收敛
+  train_batch_size: 1
+  gradient_accumulation_steps: 1    # effective_batch = 1×4GPU = 4，4张图刚好覆盖
+  mixed_precision: "bf16"
+  cache_latents: true               # 预计算 latent + 卸载 VAE encoder，节省显存
+  cache_text_embeddings: true       # 预计算文本嵌入 + 卸载文本编码器
+
+  validation_steps: 100             # 频繁验证观察收敛
+  save_steps: 250
+  keep_last_n_checkpoints: 2
+  lr_warmup_steps: 0                # 无热身，直接高学习率
+  lr_scheduler: "constant"          # 恒定学习率（cosine 会让 LR 归零，后段白训）
+
+  gradient_checkpointing: true
+  attention_backend: "sdpa"
+  enable_channels_last: true
+  allow_tf32: true
+  dataloader_num_workers: 0         # 4 张图用主进程加载即可
+
+  loss_type: "mse"                  # 过拟合用 MSE 更直观观察 loss
+  noise_offset: 0.0                 # 关闭所有正则化
+  min_snr_gamma: 0.0
+
+data:
+  train_data_dir: "/home/daiqing_tan/stable_diffusion_lora/data/overfit_test/train"
+  resolution: 1024
+  caption: "architectural floor plan, blueprint, technical drawing"
+  use_aspect_ratio_bucketing: false
+  center_crop: false
+  random_flip: false                # 关闭翻转，保持训练数据完全固定
+
+validation:
+  prompts:
+    - "architectural floor plan, blueprint, technical drawing"
+    - "architectural floor plan, blueprint, technical drawing"
+    - "architectural floor plan, blueprint, technical drawing"
+    - "architectural floor plan, blueprint, technical drawing"
+  negative_prompt: "blurry, noisy, low quality, photo"
+  num_inference_steps: 20
+  guidance_scale: 7.5
+  seed: 42
+  num_images_per_prompt: 1
+
+  compute_fid: false

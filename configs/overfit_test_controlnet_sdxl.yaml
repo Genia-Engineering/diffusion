@@ -1,0 +1,96 @@
+# ============================================================
+# SDXL ControlNet 过拟合测试配置
+#
+# 目的：用 4 张图片验证 ControlNet 是否能完全拟合训练数据，
+#       loss 应稳步下降趋近 0，生成图应越来越接近原图。
+#
+# 与 smoke_test 的关键区别：
+#   smoke_test → 验证训练流程完整性（20步，不关心 loss 是否下降）
+#   overfit    → 验证模型学习能力（800步，期望 loss → 0，图像 → 原图）
+#
+# 数据准备（首次运行前执行一次）：
+#   python scripts/prepare_overfit_data.py
+#   → 随机采样 4 对图片到 data/overfit_test/{train,conditioning}/
+#
+# 预计耗时（4× A10G）：
+#   800 步 × ~5s/step ≈ ~67 min
+#   触发 8 次验证（每 100 步），可观察收敛曲线
+# ============================================================
+
+model:
+  pretrained_model_name_or_path: "stabilityai/stable-diffusion-xl-base-1.0"
+  model_type: "sdxl"
+  weights_dir: "/home/daiqing_tan/stable_diffusion_lora/weights"
+  merged_unet_path: "/home/daiqing_tan/stable_diffusion_lora/outputs/lora_sdxl_floorplan/merged_step_000810"
+
+controlnet:
+  conditioning_type: "precomputed"
+  conditioning_channels: 3
+  freeze_cross_attention: true   # 单卡运行无 DDP 梯度 buffer 压力，解冻让 ControlNet 充分学习
+  freeze_down_blocks: []
+  freeze_mid_block: false
+  conditioning_scale: 1.5        # 训练时 ControlNet 残差对 UNet 的缩放系数（0=无影响，1=全量，>1=增强）
+
+  # Zero Conv 初始化策略:
+  #   "zero"    — 原始论文做法，训练初期 ControlNet 完全不影响 UNet（默认）
+  #   "normal"  — N(0, conv_init_std) 小随机值，训练开始即有微弱结构引导
+  #   "xavier"  — Xavier uniform，适合需要更快收敛的场景
+  #   "kaiming" — Kaiming normal，适合 ReLU 类激活
+  conv_zero_init: "normal"       # 过拟合测试：跳过 zero init，让结构影响从第 0 步就存在
+  conv_init_std: 0.02            # normal 模式的标准差（xavier/kaiming 忽略此项）
+
+  # 语义区域加权 loss:
+  #   semantic_loss_weight — 语义色块区域的 loss 权重倍率（1.0=关闭，>1.0=前景加权）
+  #   semantic_bg_threshold — 条件图 RGB 总和阈值，低于此值视为黑色背景
+  semantic_loss_weight: 10.0
+  semantic_bg_threshold: 0.1
+
+training:
+  output_dir: "./outputs/overfit_test_controlnet_sdxl"
+
+  num_train_steps: 800
+  learning_rate: 1.0e-4            # 过拟合无需保守，与 XS 配置一致
+  train_batch_size: 1
+  gradient_accumulation_steps: 1   # effective_batch = 1×4GPU = 4，4张图刚好覆盖
+  mixed_precision: "bf16"
+  cache_latents: true              # 预计算 latent + 卸载 VAE encoder，节省显存
+  cache_text_embeddings: true      # 预计算文本嵌入 + 卸载文本编码器，节省 ~1.65GB
+
+  validation_steps: 100            # 频繁验证观察收敛
+  save_steps: 200
+  keep_last_n_checkpoints: 4
+  lr_warmup_steps: 0               # 无热身，直接高学习率
+  lr_scheduler: "constant"         # 恒定学习率（关键！cosine 会让 LR 归零，后段白训）
+
+  gradient_checkpointing: true
+  attention_backend: "sdpa"
+  enable_channels_last: true
+  allow_tf32: true
+  dataloader_num_workers: 0        # 4 张图用主进程加载即可
+
+  loss_type: "mse"                 # 过拟合用 MSE 更直观观察 loss
+  noise_offset: 0.0                # 关闭所有正则化
+  min_snr_gamma: 0.0
+
+data:
+  train_data_dir: "/home/daiqing_tan/stable_diffusion_lora/data/overfit_test/train"
+  conditioning_data_dir: "/home/daiqing_tan/stable_diffusion_lora/data/overfit_test/conditioning"
+  resolution: 1024
+  caption: "architectural floor plan, blueprint, technical drawing"
+  use_aspect_ratio_bucketing: false
+  center_crop: false
+  random_flip: false               # 关闭翻转，保持训练数据完全固定
+
+validation:
+  prompts:
+    - "architectural floor plan, blueprint, technical drawing"
+    - "architectural floor plan, blueprint, technical drawing"
+    - "architectural floor plan, blueprint, technical drawing"
+    - "architectural floor plan, blueprint, technical drawing"
+  negative_prompt: "blurry, noisy, low quality, photo"
+  num_inference_steps: 20          # 比 smoke 多，提升生成质量以便观察过拟合效果
+  guidance_scale: 7.5
+  seed: 42
+
+  controlnet_conditioning_scale: 1.5  # 验证推理时的缩放系数，与 controlnet.conditioning_scale 独立可调
+  compute_fid: false

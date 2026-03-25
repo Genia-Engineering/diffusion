@@ -1,0 +1,84 @@
+# ============================================================
+# SDXL ControlNet-XS 过拟合测试配置
+#
+# 目的：用 4 张图片验证 ControlNet-XS adapter 是否能完全拟合训练数据。
+#
+# XS vs 标准 ControlNet 过拟合测试差异：
+#   - 可训练参数：~48M（XS）vs ~654M（标准），收敛更快
+#   - 无 freeze_cross_attention：adapter 参数始终全量可训练
+#   - 无显存压力：XS 显存占用减少 ~45%，4 卡轻松运行
+#
+# 数据准备（与标准 ControlNet 过拟合测试共用同一批图片）：
+#   python scripts/prepare_overfit_data.py
+#   → 随机采样 4 对图片到 data/overfit_test/{train,conditioning}/
+#
+# 预计耗时（4× A10G）：
+#   800 步 × ~3s/step ≈ ~40 min（XS 推理比标准快约 20-25%）
+#   触发 8 次验证（每 100 步），可观察收敛曲线
+# ============================================================
+
+model:
+  pretrained_model_name_or_path: "stabilityai/stable-diffusion-xl-base-1.0"
+  model_type: "sdxl"
+  weights_dir: "/home/daiqing_tan/stable_diffusion_lora/weights"
+  merged_unet_path: "/home/daiqing_tan/stable_diffusion_lora/outputs/lora_sdxl_floorplan/merged_step_000810"
+
+controlnet:
+  conditioning_type: "precomputed"
+  conditioning_channels: 3
+  conditioning_scale: 1.0        # 训练时 ControlNet 残差对 UNet 的缩放系数
+  conv_zero_init: "normal"       # 过拟合测试：跳过 zero init，让结构影响从第 0 步就存在
+  conv_init_std: 0.02
+
+controlnet_xs:
+  size_ratio: null                 # null 使用 diffusers 默认值
+
+training:
+  output_dir: "./outputs/overfit_test_controlnet_xs_sdxl"
+
+  num_train_steps: 800
+  learning_rate: 1.0e-4            # XS 参数少，高学习率加速过拟合
+  train_batch_size: 1
+  gradient_accumulation_steps: 1   # effective_batch = 1×4GPU = 4，4张图刚好覆盖
+  mixed_precision: "bf16"
+  cache_latents: true              # 预计算 latent + 卸载 VAE encoder
+  cache_text_embeddings: true      # 预计算文本嵌入 + 卸载文本编码器
+
+  validation_steps: 100            # 频繁验证观察收敛
+  save_steps: 200
+  keep_last_n_checkpoints: 4
+  lr_warmup_steps: 0               # 无热身，直接高学习率
+  lr_scheduler: "constant"         # 恒定学习率（cosine 会归零，后段白训）
+
+  gradient_checkpointing: true
+  attention_backend: "sdpa"
+  enable_channels_last: true
+  allow_tf32: true
+  dataloader_num_workers: 0
+
+  loss_type: "mse"                 # 过拟合用 MSE 更直观观察 loss
+  noise_offset: 0.0                # 关闭所有正则化
+  min_snr_gamma: 0.0
+
+data:
+  train_data_dir: "/home/daiqing_tan/stable_diffusion_lora/data/overfit_test/train"
+  conditioning_data_dir: "/home/daiqing_tan/stable_diffusion_lora/data/overfit_test/conditioning"
+  resolution: 1024
+  caption: "architectural floor plan, blueprint, technical drawing"
+  use_aspect_ratio_bucketing: false
+  center_crop: false
+  random_flip: false
+
+validation:
+  prompts:
+    - "architectural floor plan, blueprint, technical drawing"
+    - "architectural floor plan, blueprint, technical drawing"
+    - "architectural floor plan, blueprint, technical drawing"
+    - "architectural floor plan, blueprint, technical drawing"
+  negative_prompt: "blurry, noisy, low quality, photo"
+  num_inference_steps: 20
+  guidance_scale: 7.5
+  seed: 42
+  controlnet_conditioning_scale: 1.0  # 验证推理时的缩放系数
+
+  compute_fid: false

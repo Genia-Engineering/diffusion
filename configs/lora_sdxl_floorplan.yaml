@@ -1,0 +1,80 @@
+# ============================================================
+# SDXL QLoRA 微调配置 — 建筑平面图（无文本提示词）
+# 硬件: 4× NVIDIA A10G (23GB each)
+# 数据集: 3400 张 1024×1024 PNG，无 caption
+#
+# QLoRA 策略:
+#   UNet 基础权重以 NF4 (4-bit) 量化加载，计算精度 bf16；
+#   LoRA 适配器以 bf16 训练。量化将 UNet 显存从 ~5.2GB 降至 ~1.5GB，
+#   节省的显存用于支撑更高的 LoRA rank (128)，提升模型表达力。
+#
+# 显存估算 (per GPU):
+#   UNet(NF4) ~1.5GB + LoRA(rank=128,bf16) ~0.3GB + VAE(bf16) ~0.3GB
+#   + TE1-CLIP-L(frozen) ~0.25GB + TE2-OpenCLIP-G(frozen) ~1.4GB
+#   + Activations(梯度检查点+SDPA) ~10GB ≈ 14-15GB，低于 23GB
+#
+# 步数推算:
+#   train_batch_size=4 per GPU, grad_accum=8, 4GPUs → effective_batch=128
+#   每 epoch 优化器步数 = ⌈3400 ÷ 128⌉ = 27 步
+#   30 epoch = 27 × 30 = 810 步
+# ============================================================
+
+model:
+  pretrained_model_name_or_path: "stabilityai/stable-diffusion-xl-base-1.0"
+  model_type: "sdxl"
+  weights_dir: "/home/daiqing_tan/stable_diffusion_lora/weights"
+
+lora:
+  rank: 128
+  alpha: 128
+  use_qlora: true                     # 启用 QLoRA: UNet 以 NF4 量化加载，LoRA 适配器 bf16 训练
+  qlora_compute_dtype: "bf16"         # QLoRA 前向计算精度: "bf16" | "fp16"
+  target_modules:
+    - "to_q"
+    - "to_k"
+    - "to_v"
+    - "to_out.0"
+    - "ff.net.0.proj"
+    - "ff.net.2"
+  train_text_encoder: false
+  train_text_encoder_2: false        # SDXL 第二文本编码器 OpenCLIP-G，同样冻结
+
+training:
+  output_dir: "./outputs/lora_sdxl_floorplan"
+  num_train_steps: 810               # 30 epoch (3400 images, effective_batch=128, 27 step/epoch)
+  learning_rate: 1.0e-4             # QLoRA + rank=128，保持与之前相同学习率
+  train_batch_size: 4               # 每 GPU 4 个样本；1024² 显存压力约为 512² 的 4×
+  gradient_accumulation_steps: 8    # 累积 8 步 → effective batch = 4×4GPU×8accum = 128
+  mixed_precision: "bf16"
+  cache_latents: true             # 预计算 VAE latent，卸载 encoder 节省显存
+
+  validation_steps: 162             # 每 162 步验证一次（约每 6 epoch，与 save 对齐）
+  save_steps: 162                   # 810 ÷ 5 = 162，均匀保存 5 个 checkpoint
+  keep_last_n_checkpoints: 5
+  lr_warmup_steps: 138              # ~17% 总步数（810 × 0.17 ≈ 138）
+
+  loss_type: "huber"                # Huber loss 替代 MSE，对异常值更鲁棒
+  huber_delta: 0.1                  # Huber loss delta 参数
+  noise_offset: 0.1                 # 改善平面图极暗/极亮区域（线条、白底）的对比度还原
+  min_snr_gamma: 5.0                # Min-SNR 加权，平衡高/低噪声步的 loss 贡献
+
+data:
+  train_data_dir: "/home/daiqing_tan/stable_diffusion_lora/data/overfit_test/train"
+  resolution: 1024
+  caption: "architectural floor plan, blueprint, technical drawing"
+
+validation:
+  prompts:
+    - "architectural floor plan, blueprint, technical drawing"
+  negative_prompt: "blurry, noisy, low quality"
+  num_inference_steps: 25
+  guidance_scale: 7.5
+  seed: 42
+  num_images_per_prompt: 4
+
+  compute_fid: true             # 开启 FID（需 pip install 'torchmetrics[image]'）
+  fid:
+    num_real_images: 512        # 从训练图中抽样
+    num_gen_images: 256         # 4卡并行各生成64张，合计256张
+    feature_dim: 2048
+    real_features_cache: "./outputs/lora_sdxl_floorplan/fid_real_features.pt"

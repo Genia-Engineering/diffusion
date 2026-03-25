@@ -1,0 +1,76 @@
+# ============================================================
+# SDXL ControlNet-XS 训练配置
+#
+# ControlNet-XS vs 标准 ControlNet:
+#   - 参数量: ~48M (标准 ~1.3B)，仅 base model 的 ~1%
+#   - 推理速度: 快 20-25%
+#   - 显存占用: 减少 ~45%
+#   - 单次联合前向传播，无需分别调用 controlnet + unet
+#
+# 数据集 ~3400，batch_size=2，grad_accum=4
+# 425 opt_step/epoch × 40 epoch = 17000 step
+#
+# 显存估算 (per GPU, A10G 23GB):
+#   UNetControlNetXSModel(bf16) ~5.5GB + VAE(bf32) ~0.3GB
+#   + TE1-CLIP-L(frozen) ~0.25GB + TE2-OpenCLIP-G(frozen) ~1.4GB
+#   + Activations(梯度检查点+SDPA) ~6GB ≈ 13-14GB
+# ============================================================
+
+model:
+  pretrained_model_name_or_path: "stabilityai/stable-diffusion-xl-base-1.0"
+  model_type: "sdxl"
+  weights_dir: "/home/daiqing_tan/stable_diffusion_lora/weights"
+  merged_unet_path: "/home/daiqing_tan/stable_diffusion_lora/outputs/lora_sdxl_floorplan/merged_step_000810"
+
+controlnet:
+  conditioning_type: "precomputed"
+  conditioning_channels: 3
+
+controlnet_xs:
+  size_ratio: null                 # null 使用 diffusers 默认值；可设为 0.1 等自定义比例
+
+training:
+  output_dir: "./outputs/controlnet_xs_sdxl"
+  num_train_steps: 17000
+  learning_rate: 1.0e-5
+  train_batch_size: 2
+  gradient_accumulation_steps: 4
+  mixed_precision: "bf16"
+  cache_latents: true
+  cache_text_embeddings: true
+
+  validation_steps: 850
+  save_steps: 2125
+  keep_last_n_checkpoints: 6
+  lr_warmup_steps: 500
+
+  gradient_checkpointing: true
+  attention_backend: "sdpa"
+  enable_channels_last: true
+  allow_tf32: true
+  dataloader_num_workers: 4
+
+  loss_type: "huber"
+  huber_delta: 0.1
+  noise_offset: 0.1
+  min_snr_gamma: 5.0
+
+data:
+  train_data_dir: "/home/daiqing_tan/stable_diffusion_lora/data/data/size_1024/floor"
+  conditioning_data_dir: "/home/daiqing_tan/stable_diffusion_lora/data/data/size_1024_controlnet/floor"
+  resolution: 1024
+  caption: "architectural floor plan, blueprint, technical drawing"
+  use_aspect_ratio_bucketing: true
+  center_crop: false
+  random_flip: true
+
+validation:
+  prompts:
+    - "architectural floor plan, blueprint, technical drawing"
+    - "architectural floor plan, blueprint, technical drawing"
+    - "architectural floor plan, blueprint, technical drawing"
+    - "architectural floor plan, blueprint, technical drawing"
+  negative_prompt: "blurry, noisy, low quality, photo"
+  num_inference_steps: 25
+  guidance_scale: 7.5
+  seed: 42

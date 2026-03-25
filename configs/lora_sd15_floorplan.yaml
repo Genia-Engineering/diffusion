@@ -1,0 +1,67 @@
+# ============================================================
+# SD 1.5 LoRA 微调配置 — 建筑平面图（无文本提示词）
+# 硬件: 2× NVIDIA A10G (23GB each)
+# 数据集: 4521 张 512×512 PNG，无 caption
+#
+# 显存估算 (per GPU):
+#   UNet(bf16) 1.7GB + VAE(fp32) 0.85GB + TE(frozen) 0.5GB
+#   + Activations(梯度检查点+xFormers) ~4GB ≈ 7-8GB，远低于 23GB
+#
+# 步数推算:
+#   batch_size=32, grad_accum=2, 2GPUs → effective_batch=64（每 GPU 16 个样本）
+#   每 epoch 优化器步数 = 4521 ÷ 64 ≈ 71 步
+#   ~30 epoch = 2130 步
+#
+# 调参记录 (v2, 基于 step-1200 训练曲线):
+#   - loss 在 step 1200 仍下降(0.0496)未收敛 → 步数扩展至 30 epoch
+#   - grad_norm 持续攀升 + loss 振荡幅度大 → 峰值 LR 从 1e-4 → 8e-5
+#   - warmup_steps 按比例调整至 360（约占总步数 17%）
+#   - save_steps=426 均匀保存 5 个 checkpoint
+#   - validation_steps=300，每次生成 4 张测试图
+#   - effective batch=64：train_batch_size=32 + grad_accum=2（避免 OOM）
+# ============================================================
+
+model:
+  pretrained_model_name_or_path: "runwayml/stable-diffusion-v1-5"
+  model_type: "sd15"
+  weights_dir: "/home/daiqing_tan/stable_diffusion_lora/weights"  # 本地权重缓存目录
+
+lora:
+  rank: 32
+  alpha: 32
+  target_modules:
+    - "to_q"
+    - "to_k"
+    - "to_v"
+    - "to_out.0"
+    - "ff.net.0.proj"
+    - "ff.net.2"
+  train_text_encoder: false
+
+training:
+  output_dir: "./outputs/lora_sd15_floorplan"
+  num_train_steps:   2130            # 30 epoch (4521 images, effective_batch=64, 71 step/epoch)
+  learning_rate: 8.0e-5             # 从 1e-4 降低，减少 loss 振荡和 grad_norm 攀升
+  train_batch_size: 32              # 每 GPU 16 个样本，避免 OOM
+  gradient_accumulation_steps: 2    # 累积 2 步 → effective batch = 16×2GPU×2accum = 64
+  mixed_precision: "bf16"
+  cache_latents: true             # 预计算 VAE latent，卸载 encoder 节省显存
+
+  validation_steps: 300             # 每 300 步生成 4 张测试图
+  save_steps: 426                   # 2130 ÷ 5 = 426，均匀保存 5 个 checkpoint
+  keep_last_n_checkpoints: 5
+  lr_warmup_steps: 360              # ~17% 总步数（2130 × 0.17 ≈ 360）
+
+data:
+  train_data_dir: "/home/daiqing_tan/stable_diffusion_lora/data/data/size_512"
+  resolution: 512
+  caption: "architectural floor plan, blueprint, technical drawing"
+
+validation:
+  prompts:
+    - "architectural floor plan, blueprint, technical drawing"
+  negative_prompt: "blurry, noisy, low quality"
+  num_inference_steps: 25
+  guidance_scale: 7.5
+  seed: 42
+  num_images_per_prompt: 4
