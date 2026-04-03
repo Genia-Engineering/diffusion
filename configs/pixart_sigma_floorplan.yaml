@@ -33,8 +33,8 @@ model:
 training:
   output_dir: "./outputs/pixart_sigma_floorplan"
   num_train_steps: 2400              # ~60 epoch (3432 images, effective_batch=64, 54 step/epoch)
-  learning_rate: 5.0e-5              # 全参 DDPM + 加权 Loss: 比 FM 的 2e-5 减半，避免加权梯度过大导致震荡
-  train_batch_size: 32                # 每 GPU 8 个样本（gc=ON 时实测 ~12-14GB，安全）
+  learning_rate: 2.0e-4              # 全参 DDPM + 加权 Loss: 比 FM 的 2e-5 减半，避免加权梯度过大导致震荡
+  train_batch_size: 64                # 每 GPU 8 个样本（gc=ON 时实测 ~12-14GB，安全）
   gradient_accumulation_steps: 2     # effective batch = 8×4GPU×2accum = 64
   mixed_precision: "bf16"
   cache_latents: true

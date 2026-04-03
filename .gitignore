@@ -32,7 +32,12 @@ logs/
 # Model weights & checkpoints
 weights/
 outputs/
-data/
+
+# data/ 目录下的实际数据集（非代码）
+data/data/
+data/overfit_test/
+data/overfit_test_16img/
+data/val_conditioning_images/
 
 # Images
 *.png
