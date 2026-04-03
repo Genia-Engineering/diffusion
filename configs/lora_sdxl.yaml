@@ -19,6 +19,13 @@
 #   - 学习率: 8e-5→6e-5（SDXL 参数量更大，适当降低）
 #   - 双文本编码器: CLIP-L + OpenCLIP-G（均冻结），新增 train_text_encoder_2
 #   - 训练脚本需开启 SDXL size conditioning（original_size / target_size / crop_coords）
+#
+# 启动方式:
+#   bash train.sh lora sdxl --config configs/lora_sdxl.yaml          # 标准多卡
+#   bash train.sh lora sdxl --config configs/lora_sdxl.yaml resume   # 恢复训练
+#
+# FID 评估:
+#   bash train.sh eval_fid --config configs/lora_sdxl.yaml
 # ============================================================
 
 model:

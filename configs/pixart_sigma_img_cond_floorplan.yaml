@@ -1,18 +1,21 @@
 # ============================================================
-# PixArt-Sigma 图像条件微调配置 — 建筑平面图
-# 用图像编码器替代 T5-XXL 文本编码器，条件信号来自 color 平面图
+# PixArt-Sigma 图像条件微调配置 — 建筑平面图 (CLIP + LoRA)
+# 用 CLIP 图像编码器替代 T5-XXL 文本编码器，条件信号来自 color 平面图
+# Transformer 注入 LoRA 低秩适配，冻结 base weights
 #
-# 训练范式: Rectified Flow (Flow Matching)
+# 训练范式: 支持双噪声范式 (通过 noise_paradigm 切换)
+#   - "flow_matching": Rectified Flow velocity prediction (默认)
+#   - "ddpm": 传统 DDPM epsilon/v-prediction, scheduler.add_noise 加噪
 # 条件来源: size_1024_controlnet/floor (color 条件图)
 # 目标输出: size_1024/floor (详细平面图)
 #
 # 硬件: 4× NVIDIA A10G (23GB each)
 # 显存估算 (per GPU, bf16, gc=ON):
-#   cache_latents + cache_cond_features → VAE & DINOv2 不占训练显存
-#   Transformer(bf16) ~1.2GB + Adam优化器 ~4.8GB + 梯度 ~1.2GB = 7.2GB
-#   VAE 投射层(3×Conv, ~236M params, bf16) ~0.5GB + Adam ~1.9GB + 梯度 ~0.5GB = 2.9GB
-#   DINOv2 投射层(MLP, ~33M params) ~0.1GB
-#   激活值(gc, batch=8) ~10GB → 合计 VAE ~20.1GB / DINOv2 ~17.3GB < 23GB
+#   cache_latents + cache_cond_features → VAE & CLIP 不占训练显存
+#   Transformer(bf16, frozen) ~1.2GB
+#   LoRA(rank=32, attn+ffn) ~0.03GB + Adam优化器 ~0.1GB + 梯度 ~0.03GB
+#   CLIP 投射层(MLP) ~0.05GB + Adam ~0.2GB + 梯度 ~0.05GB
+#   激活值(gc, batch=8) ~10GB → 合计 ~11.7GB < 23GB
 #
 # 步数推算:
 #   train_batch_size=8, grad_accum=2, 4GPUs → effective_batch=64
@@ -22,6 +25,9 @@
 # 启动方式:
 #   bash train.sh pixart_ic
 #   bash train.sh pixart_ic resume
+#
+# FID 评估:
+#   bash train.sh eval_fid --config configs/pixart_sigma_img_cond_floorplan.yaml
 # ============================================================
 
 model:
@@ -30,25 +36,38 @@ model:
   weights_dir: "/home/daiqing_tan/stable_diffusion_lora/weights"
 
   image_encoder:
-    type: "vae"                              # "vae" 或 "dinov2"
-    dinov2_model: "facebook/dinov2-large"   # DINOv2 模型 ID (仅 type=dinov2)
-    dinov2_resolution: 518                  # DINOv2 输入分辨率 (null=原始分辨率)
-    projection_dim: 4096                    # 投射维度 (匹配 caption_channels)
-    vae_hidden_channels: [512, 2048]        # VAE 投射层中间通道数 (仅 type=vae)
+    type: "clip"
+    clip_model: "laion/CLIP-ViT-H-14-laion2B-s32B-b79K"
+    clip_resolution: 224
+    projection_dim: 4096
+
+lora:
+  enabled: true
+  rank: 32
+  alpha: 32
+  target_modules:
+    - "to_q"
+    - "to_k"
+    - "to_v"
+    - "to_out.0"
+    - "ff.net.0.proj"
+    - "ff.net.2"
 
 training:
   output_dir: "./outputs/pixart_img_cond_floorplan"
-  num_train_steps: 8000
-  learning_rate: 1.0e-5
+  num_train_steps: 10000
+  learning_rate: 1.0e-4
   train_batch_size: 8
-  gradient_accumulation_steps: 2
+  gradient_accumulation_steps: 1
   mixed_precision: "bf16"
   cache_latents: true
   cache_cond_features: true
   latent_cache_batch_size: 8
-  cond_dropout_prob: 0.1                    # CFG 训练时条件丢弃概率
-  projector_warmup_steps: 500               # 前 N 步只训练 Projector，冻结 Transformer
-  projector_warmup_lr: 1.0e-4               # Projector warmup 阶段学习率 (10× main LR)
+  cond_dropout_prob: 0.1
+
+  projector_warmup_steps: 100
+  projector_warmup_lr: 1.0e-3
+  projector_lr: 3.0e-4
 
   validation_steps: 400
   save_steps: 400
@@ -57,15 +76,27 @@ training:
   gradient_checkpointing: true
   compile_model: false
   loss_type: "mse"
+  max_grad_norm: 1.0
 
   use_ema: true
   ema_decay: 0.9999
   ema_update_after_step: 300
 
-  timestep_sampling: "logit_normal" # "uniform" 或 "logit_normal"
+  # ── 噪声范式 ──
+  # "flow_matching": Rectified Flow velocity prediction
+  # "ddpm": 传统 DDPM epsilon/v-prediction (加噪去噪模式)
+  noise_paradigm: "ddpm"
+
+  # Flow Matching 参数 (仅 noise_paradigm=flow_matching 时生效)
+  timestep_sampling: "logit_normal"
   logit_mean: 0.0
   logit_std: 1.0
   scheduler_shift: 1.0
+
+  # DDPM 参数 (仅 noise_paradigm=ddpm 时生效)
+  prediction_type: "epsilon"
+  noise_offset: 0.05
+  min_snr_gamma: 5.0
 
 data:
   train_data_dir: "/home/daiqing_tan/stable_diffusion_lora/data/data/size_1024/floor"
@@ -78,10 +109,10 @@ validation:
   guidance_scale: 4.5
   seed: 42
 
-  compute_fid: true
-  fid:
-    num_real_images: 512
-    num_gen_images: 512
-    model_name: "dinov2_vitb14"
-    batch_size: 8
-    real_features_cache: "./outputs/pixart_img_cond_floorplan/fid_real_features.npz"
+  # compute_fid: true
+  # fid:
+  #   num_real_images: 512
+  #   num_gen_images: 512
+  #   model_name: "dinov2_vitb14"
+  #   batch_size: 8
+  #   real_features_cache: "./outputs/pixart_img_cond_floorplan/fid_real_features.npz"

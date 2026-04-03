@@ -8,6 +8,7 @@
 保存内容:
   outputs/checkpoints/step_XXXXXX/
     ├── lora_unet.safetensors          # LoRA UNet delta 权重
+    ├── lora_transformer.safetensors   # LoRA Transformer delta 权重（PixArt LoRA）
     ├── lora_text_encoder.safetensors  # LoRA TE delta 权重（如果有）
     ├── controlnet/                    # ControlNet 完整权重（diffusers 格式）
     ├── optimizer.pt                   # 优化器状态（含动量、lr 等）
@@ -53,16 +54,19 @@ class CheckpointManager:
         lr_scheduler=None,
         seed: int = 42,
         is_lora: bool = True,
+        ema_loss: float | None = None,
     ) -> Path:
         """保存完整检查点。"""
         ckpt_dir = self.save_dir / f"step_{step:06d}"
         ckpt_dir.mkdir(parents=True, exist_ok=True)
 
         if is_lora:
-            self._save_lora_weights(unet, text_encoder, text_encoder_2, ckpt_dir)
+            self._save_lora_weights(
+                unet, text_encoder, text_encoder_2, ckpt_dir, transformer=transformer,
+            )
         if controlnet is not None:
             self._save_controlnet(controlnet, ckpt_dir)
-        if transformer is not None:
+        if transformer is not None and not is_lora:
             self._save_transformer(transformer, accelerator, ckpt_dir)
 
         if optimizer is not None:
@@ -75,6 +79,8 @@ class CheckpointManager:
             "epoch": global_epoch,
             "seed": seed,
         }
+        if ema_loss is not None:
+            training_state["ema_loss"] = ema_loss
         with open(ckpt_dir / "training_state.json", "w") as f:
             json.dump(training_state, f, indent=2)
 
@@ -83,11 +89,15 @@ class CheckpointManager:
         self._cleanup_old_checkpoints()
         return ckpt_dir
 
-    def _save_lora_weights(self, unet, text_encoder, text_encoder_2, ckpt_dir: Path):
+    def _save_lora_weights(
+        self, unet, text_encoder, text_encoder_2, ckpt_dir: Path, transformer=None,
+    ):
         from models.lora import save_lora_weights
 
         if unet is not None:
             save_lora_weights(unet, str(ckpt_dir / "lora_unet.safetensors"))
+        if transformer is not None:
+            save_lora_weights(transformer, str(ckpt_dir / "lora_transformer.safetensors"))
         if text_encoder is not None:
             save_lora_weights(text_encoder, str(ckpt_dir / "lora_text_encoder.safetensors"))
         if text_encoder_2 is not None:
@@ -107,13 +117,74 @@ class CheckpointManager:
         else:
             transformer.save_pretrained(str(tf_dir))
 
+    def save_best(
+        self,
+        step: int,
+        global_epoch: int,
+        best_metric_value: float,
+        unet=None,
+        text_encoder=None,
+        text_encoder_2=None,
+        controlnet=None,
+        transformer=None,
+        accelerator=None,
+        optimizer=None,
+        lr_scheduler=None,
+        seed: int = 42,
+        is_lora: bool = True,
+    ) -> Path:
+        """保存最佳检查点到固定 'best' 目录，覆盖旧的最佳检查点。"""
+        best_dir = self.save_dir / "best"
+        if best_dir.exists():
+            shutil.rmtree(best_dir)
+        best_dir.mkdir(parents=True, exist_ok=True)
+
+        if is_lora:
+            self._save_lora_weights(
+                unet, text_encoder, text_encoder_2, best_dir, transformer=transformer,
+            )
+        if controlnet is not None:
+            self._save_controlnet(controlnet, best_dir)
+        if transformer is not None and not is_lora:
+            self._save_transformer(transformer, accelerator, best_dir)
+
+        if optimizer is not None:
+            torch.save(optimizer.state_dict(), best_dir / "optimizer.pt")
+        if lr_scheduler is not None:
+            torch.save(lr_scheduler.state_dict(), best_dir / "lr_scheduler.pt")
+
+        training_state = {
+            "step": step,
+            "epoch": global_epoch,
+            "seed": seed,
+            "best_metric_value": best_metric_value,
+        }
+        with open(best_dir / "training_state.json", "w") as f:
+            json.dump(training_state, f, indent=2)
+
+        logger.info(
+            f"Best checkpoint saved: {best_dir} "
+            f"(ema_loss={best_metric_value:.6f} at step {step})"
+        )
+        return best_dir
+
+    def load_best_metric(self) -> float:
+        """从已有的 best 检查点读取最佳指标值，不存在则返回 inf。"""
+        best_state_file = self.save_dir / "best" / "training_state.json"
+        if best_state_file.exists():
+            with open(best_state_file) as f:
+                state = json.load(f)
+            return float(state.get("best_metric_value", float("inf")))
+        return float("inf")
+
     def _cleanup_old_checkpoints(self):
-        """保留最近 keep_last_n 个检查点，删除旧的。"""
+        """保留最近 keep_last_n 个检查点，删除旧的（不影响 best 目录）。"""
         if self.keep_last_n <= 0:
             return
 
         ckpt_dirs = sorted(
-            [d for d in self.save_dir.iterdir() if d.is_dir() and d.name.startswith("step_")],
+            [d for d in self.save_dir.iterdir()
+             if d.is_dir() and d.name.startswith("step_")],
             key=lambda d: int(d.name.split("_")[1]),
         )
         while len(ckpt_dirs) > self.keep_last_n:
@@ -141,14 +212,16 @@ class CheckpointManager:
         ckpt_dir = Path(checkpoint_dir)
 
         if is_lora:
-            self._load_lora_weights(unet, text_encoder, text_encoder_2, ckpt_dir)
+            self._load_lora_weights(
+                unet, text_encoder, text_encoder_2, ckpt_dir, transformer=transformer,
+            )
 
         if controlnet is not None:
             cn_dir = ckpt_dir / "controlnet"
             if cn_dir.exists():
                 controlnet = self._load_controlnet_weights(controlnet, cn_dir)
 
-        if transformer is not None:
+        if transformer is not None and not is_lora:
             tf_dir = ckpt_dir / "transformer"
             if tf_dir.exists():
                 from diffusers import PixArtTransformer2DModel
@@ -187,10 +260,20 @@ class CheckpointManager:
 
     @staticmethod
     def _load_controlnet_weights(controlnet, cn_dir: Path):
-        """加载 ControlNet 权重，自动检测 UNet-based 还是 PixArt adapter 格式。"""
+        """加载 ControlNet 权重，自动检测格式（UNet / UNet-XS / PixArt / PixArt-XS）。"""
         from models.controlnet_pixart import PixArtControlNetAdapterModel
+        from models.controlnet_xs_pixart import PixArtControlNetXSAdapter
+        from diffusers.models.controlnets.controlnet_xs import ControlNetXSAdapter
 
-        if isinstance(controlnet, PixArtControlNetAdapterModel):
+        if isinstance(controlnet, PixArtControlNetXSAdapter):
+            loaded_cn = PixArtControlNetXSAdapter.from_pretrained(str(cn_dir))
+            controlnet.load_state_dict(loaded_cn.state_dict())
+            del loaded_cn
+        elif isinstance(controlnet, ControlNetXSAdapter):
+            loaded_cn = ControlNetXSAdapter.from_pretrained(str(cn_dir))
+            controlnet.load_state_dict(loaded_cn.state_dict())
+            del loaded_cn
+        elif isinstance(controlnet, PixArtControlNetAdapterModel):
             loaded_cn = PixArtControlNetAdapterModel.from_pretrained(str(cn_dir))
             controlnet.load_state_dict(loaded_cn.state_dict())
             del loaded_cn
@@ -201,12 +284,18 @@ class CheckpointManager:
             del loaded_cn
         return controlnet
 
-    def _load_lora_weights(self, unet, text_encoder, text_encoder_2, ckpt_dir: Path):
+    def _load_lora_weights(
+        self, unet, text_encoder, text_encoder_2, ckpt_dir: Path, transformer=None,
+    ):
         from models.lora import load_lora_weights
 
         lora_unet_path = ckpt_dir / "lora_unet.safetensors"
         if unet is not None and lora_unet_path.exists():
             load_lora_weights(unet, str(lora_unet_path))
+
+        lora_tf_path = ckpt_dir / "lora_transformer.safetensors"
+        if transformer is not None and lora_tf_path.exists():
+            load_lora_weights(transformer, str(lora_tf_path))
 
         lora_te_path = ckpt_dir / "lora_text_encoder.safetensors"
         if text_encoder is not None and lora_te_path.exists():

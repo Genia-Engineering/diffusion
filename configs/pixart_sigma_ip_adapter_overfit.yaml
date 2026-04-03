@@ -1,0 +1,92 @@
+# ============================================================
+# PixArt-Sigma IP-Adapter 过拟合测试 (32 张图片)
+#
+# 目的: 验证 IP-Adapter 训练流程正确性。如果模型能在 32 张图片上过拟合
+#       (loss 持续下降至接近 0, 生成图近似训练图), 说明:
+#         ✓ CLIP 特征预缓存 + 加载管线正确
+#         ✓ ImageProjectionModel (Perceiver Resampler) 前向/反向正确
+#         ✓ IPAdapterAttnProcessor2_0 decoupled cross-attention 注入正确
+#         ✓ T5 文本条件 + CLIP 图像条件双路径正确
+#         ✓ Flow Matching 损失计算正确
+#
+# 硬件: 4× NVIDIA A10G (23GB each)
+# 步数推算:
+#   train_batch_size=8, grad_accum=1, 4GPUs → effective_batch=32
+#   每 epoch ≈ 1 步 (32 张全部覆盖)
+#   2000 步 = 2000 epoch → 充分过拟合
+#
+# 显存估算 (per GPU, bf16, gc=ON, freeze_transformer=true):
+#   Transformer (frozen, bf16): ~1.2GB (仅前向)
+#   IP-Adapter (ImageProjection + attn processors): ~137M params → ~0.27GB + 优化器 ~1.1GB
+#   VAE decoder: ~0.08GB
+#   激活值 (gradient checkpointing): ~4-6GB
+#   T5/CLIP/VAE encoder: 预缓存后全部卸载
+#   合计: ~8-10GB/卡
+#
+# 启动方式:
+#   bash train.sh pixart_ipa_overfit
+#
+# FID 评估:
+#   bash train.sh eval_fid --config configs/pixart_sigma_ip_adapter_overfit.yaml
+# ============================================================
+
+model:
+  pretrained_model_name_or_path: "PixArt-alpha/PixArt-Sigma-XL-2-1024-MS"
+  model_type: "pixart_sigma"
+  weights_dir: "/home/daiqing_tan/stable_diffusion_lora/weights"
+
+  ip_adapter:
+    clip_model: "laion/CLIP-ViT-H-14-laion2B-s32B-b79K"
+    num_tokens: 16
+    resampler_depth: 4
+    ip_scale: 1.0
+
+training:
+  output_dir: "./outputs/pixart_ip_adapter_overfit"
+  num_train_steps: 2000
+  learning_rate: 1.0e-4
+  ip_adapter_lr: 5.0e-4               # 过拟合用更高 lr 加速收敛
+  train_batch_size: 8
+  gradient_accumulation_steps: 1
+  mixed_precision: "bf16"
+
+  freeze_transformer: true
+
+  cache_latents: true
+  cache_text_embeddings: true
+  cache_clip_features: true
+  latent_cache_batch_size: 4
+
+  cond_dropout_prob: 0.0               # 过拟合测试: 禁用图像 CFG dropout
+  text_dropout_prob: 0.0               # 过拟合测试: 禁用文本 CFG dropout
+
+  validation_steps: 200
+  save_steps: 500
+  keep_last_n_checkpoints: 3
+  lr_warmup_steps: 50
+  gradient_checkpointing: true
+  compile_model: false
+  loss_type: "mse"
+  max_grad_norm: 1.0
+
+  use_ema: false
+
+  timestep_sampling: "logit_normal"
+  logit_mean: 0.0
+  logit_std: 1.0
+  scheduler_shift: 1.0
+
+data:
+  train_data_dir: "/home/daiqing_tan/stable_diffusion_lora/data/data/size_1024_overfit/floor"
+  conditioning_data_dir: "/home/daiqing_tan/stable_diffusion_lora/data/data/size_1024_controlnet_overfit/floor"
+  resolution: 1024
+  caption: "architectural floor plan, blueprint, technical drawing"
+  random_flip: false                   # 关闭翻转，保持训练数据完全固定
+
+validation:
+  num_val_images: 4
+  num_inference_steps: 25
+  guidance_scale: 4.5
+  seed: 42
+
+  compute_fid: false

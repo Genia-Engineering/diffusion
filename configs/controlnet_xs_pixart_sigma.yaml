@@ -1,0 +1,112 @@
+# ============================================================
+# PixArt-Sigma ControlNet-XS 训练配置 — 建筑平面图
+# 硬件: 4× NVIDIA A10G (23GB each)
+# 数据集: ~3400 张 1024×1024 PNG
+#
+# 架构: PixArt-Sigma DiT (冻结) + ControlNet-XS Adapter (可训练)
+#   - XS Adapter: 14 个薄型 block (control_dim=288, 无 cross-attention)
+#   - 双向投射: base(1152) ↔ control(288), control→base 零初始化
+#   - CNN 编码器: 条件图在线通过轻量 CNN 编码（无需 VAE 预缓存）
+#   - 参数量: ~24M (base 611M 的 ~3.9%)
+#
+# 显存估算 (per GPU, bf16, gc=ON, cache_latents+cache_text):
+#   Transformer(bf16, frozen) ~1.2GB + XS Adapter+CNN(bf16) ~0.06GB
+#   + Adam优化器(fp32) ~0.19GB + 梯度 ~0.05GB
+#   + 激活值(梯度检查点, batch=4) ~4.5GB → 合计 ~6GB
+#
+# 步数推算:
+#   train_batch_size=4 per GPU, grad_accum=4, 4GPUs → effective_batch=64
+#   每 epoch 约 54 步，60 epoch = 3240 步
+#
+# 启动方式:
+#   bash train.sh pixart_cnxs           # 标准多卡
+#   bash train.sh pixart_cnxs resume    # 恢复训练
+#
+# FID 评估:
+#   bash train.sh eval_fid --config configs/controlnet_xs_pixart_sigma.yaml
+# ============================================================
+
+model:
+  pretrained_model_name_or_path: "PixArt-alpha/PixArt-Sigma-XL-2-1024-MS"
+  model_type: "pixart_sigma"
+  weights_dir: "/home/daiqing_tan/stable_diffusion_lora/weights"
+
+controlnet:
+  conditioning_mode: "cnn_encoder"
+  conditioning_type: "precomputed"
+
+controlnet_xs:
+  num_layers: 14                        # XS block 数量
+  size_ratio: 0.25                      # control_dim = 1152 * 0.25 = 288
+  connection_interval: 2                # 每 2 个 base block 一次双向交换
+
+training:
+  output_dir: "./outputs/controlnet_xs_pixart_sigma"
+  num_train_steps: 3240                 # 60 epoch
+  learning_rate: 2.0e-4                 # XS adapter 参数少，可用更高学习率
+  train_batch_size: 2
+  gradient_accumulation_steps: 4        # effective batch = 4×4GPU×4accum = 64
+  mixed_precision: "bf16"
+  cache_latents: true
+  cache_text_embeddings: true
+  latent_cache_batch_size: 4
+
+  validation_steps: 200                 # 每 6 epoch 验证一次
+  save_steps: 200                       # 每 10 epoch 保存一次
+  keep_last_n_checkpoints: 15
+
+  save_best: true                       # 保存最佳权重（基于 EMA loss）
+  best_loss_ema_decay: 0.99             # EMA 平滑系数，越大越平滑
+  lr_warmup_steps: 162                  # ~5% 总步数
+  gradient_checkpointing: true
+  attention_backend: "sdpa"
+  allow_tf32: true
+  dataloader_num_workers: 8
+
+  loss_type: "huber"
+  huber_delta: 0.1
+  noise_offset: 0.1
+  min_snr_gamma: 5.0
+
+data:
+  train_data_dir: "/home/daiqing_tan/stable_diffusion_lora/data/data/size_1024/floor"
+  conditioning_data_dir: "/home/daiqing_tan/stable_diffusion_lora/data/data/size_1024_controlnet/floor"
+  resolution: 1024
+  use_aspect_ratio_bucketing: true
+  center_crop: false
+  random_flip: true
+  t5_max_length: 300
+
+  # ── caption 模式 ──
+  # "fixed":     所有图片共用 caption 字段的统一提示词
+  # "per_image": 每张图片从 caption_dir 读取对应的 .txt 描述文件
+  caption_mode: "per_image"
+
+  # 统一提示词（caption_mode=fixed 时生效，per_image 模式下作为 fallback）
+  caption: "architectural floor plan, blueprint, technical drawing"
+
+  # ── 逐图 caption 配置（caption_mode=per_image 时生效）──
+  caption_dir: "/home/daiqing_tan/stable_diffusion_lora/data/data/description"
+  caption_stem_replace:
+    from: "___total__1024"
+    to: "_controlnet_color_1024"
+  caption_fallback: "architectural floor plan, blueprint, technical drawing"
+
+validation:
+  # 验证样本数: 从训练集随机抽取 N 对 (条件图, caption, ground truth)
+  num_val_samples: 4
+
+  # prompt_source: 验证时文本提示词的来源
+  #   "config"  — 使用下方 prompts 列表（适合对比不同描述的泛化能力）
+  #   "data"    — 使用训练数据中的逐图 caption（与 caption_mode=per_image 配合）
+  prompt_source: "data"
+
+  # caption_mode=fixed 或 prompt_source=config 时使用
+  prompts:
+    - "architectural floor plan, blueprint, technical drawing"
+
+  negative_prompt: ""
+  num_inference_steps: 20
+  guidance_scale: 4.5
+  seed: 42
+  num_images_per_prompt: 1

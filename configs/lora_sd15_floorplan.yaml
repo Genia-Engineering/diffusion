@@ -19,6 +19,13 @@
 #   - save_steps=426 均匀保存 5 个 checkpoint
 #   - validation_steps=300，每次生成 4 张测试图
 #   - effective batch=64：train_batch_size=32 + grad_accum=2（避免 OOM）
+#
+# 启动方式:
+#   bash train.sh lora sd15              # 标准多卡
+#   bash train.sh lora sd15 resume       # 恢复训练
+#
+# FID 评估:
+#   bash train.sh eval_fid --config configs/lora_sd15_floorplan.yaml
 # ============================================================
 
 model:

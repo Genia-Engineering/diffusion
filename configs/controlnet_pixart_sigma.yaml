@@ -22,6 +22,9 @@
 # 启动方式:
 #   bash train.sh pixart_cn           # 标准多卡
 #   bash train.sh pixart_cn resume    # 恢复训练
+#
+# FID 评估:
+#   bash train.sh eval_fid --config configs/controlnet_pixart_sigma.yaml
 # ============================================================
 
 model:

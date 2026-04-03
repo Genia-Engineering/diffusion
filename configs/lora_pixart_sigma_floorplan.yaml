@@ -1,0 +1,137 @@
+# ============================================================
+# PixArt-Sigma LoRA 微调配置 — 建筑平面图（正式训练）
+# 训练范式: Rectified Flow (Flow Matching) + LoRA 低秩适配
+# 硬件: 4× NVIDIA A10G (23GB each)
+# 数据集: ~3400 张 1024×1024 PNG，逐图 caption（结构化描述）
+#
+# 显存估算 (per GPU, bf16, gc=ON):
+#   cache_latents + cache_text_embeddings → VAE & T5-XXL 不占训练显存
+#   Transformer(bf16, frozen) ~1.2GB
+#   LoRA 参数(rank=64, attn+ffn) ~0.12GB + Adam优化器 ~0.46GB + 梯度 ~0.12GB
+#   激活值(梯度检查点, batch=8, seq=4096) ~9.6GB → 合计 ~11.5GB（富余 ~11GB）
+#   effective batch = 8 × 4 GPU × 1 grad_accum = 32
+#   每 epoch ~107 步, 3000 步 ≈ 28 epochs
+#
+# 启动方式:
+#   bash train.sh pixart_lora             # 标准多卡（推荐）
+#   bash train.sh pixart_lora resume      # 恢复训练
+#
+# FID 评估:
+#   bash train.sh eval_fid --config configs/lora_pixart_sigma_floorplan.yaml
+# ============================================================
+
+model:
+  pretrained_model_name_or_path: "PixArt-alpha/PixArt-Sigma-XL-2-1024-MS"
+  model_type: "pixart_sigma"
+  weights_dir: "/home/daiqing_tan/stable_diffusion_lora/weights"
+
+lora:
+  rank: 64                          # LoRA 低秩维度; 62M 可训练参数(基础模型 8.2%)，域适配足够
+  alpha: 64                         # LoRA 缩放系数, alpha=rank → scale=1.0
+  target_modules:                   # 注入 LoRA 的 Transformer 子模块（attn + FFN 全覆盖，域迁移需要）
+    - "to_q"                        # 自注意力 / 交叉注意力 Q 投影
+    - "to_k"                        # 自注意力 / 交叉注意力 K 投影
+    - "to_v"                        # 自注意力 / 交叉注意力 V 投影
+    - "to_out.0"                    # 注意力输出投影
+    - "ff.net.0.proj"               # FFN 门控层（GEGLU gate）
+    - "ff.net.2"                    # FFN 输出层
+
+training:
+  output_dir: "./outputs/pixart_sigma_lora_floorplan"
+  num_train_steps: 3000             # 总训练步数; effective batch=32 → 每 epoch ~107 步 → ~28 epochs
+  learning_rate: 5.0e-5             # LoRA 参数学习率; rank=64 时 5e-5 比 1e-4 更稳定
+  train_batch_size: 16               # 每 GPU 每步 batch size; 降低以获得更多梯度更新
+  gradient_accumulation_steps: 2    # 梯度累积步数, effective batch = 8 × 4GPU × 1 = 32
+  mixed_precision: "bf16"           # 混合精度训练
+  cache_latents: true               # 预计算 VAE latent 并缓存至磁盘，训练时跳过 VAE encode
+  cache_text_embeddings: true       # 预计算 T5 文本嵌入并缓存，训练时卸载 T5 释放 ~18GB 显存
+  latent_cache_batch_size: 8        # VAE latent 预计算时的 batch size
+
+  validation_steps: 300             # 每 N 步执行一次验证生图（~2.3 epoch 一次）
+  save_steps: 300                   # 每 N 步保存一次 checkpoint
+  keep_last_n_checkpoints: 10        # 仅保留最近 N 个 checkpoint，自动清理旧的
+  lr_warmup_steps: 100              # 学习率线性预热步数（~1 epoch），避免初期震荡
+  caption_dropout_rate: 0.1         # 训练时以 10% 概率丢弃 caption（用空嵌入替换），增强无条件生成能力
+  gradient_checkpointing: true      # 梯度检查点，用计算换显存
+  compile_model: false              # 是否 torch.compile 加速（当前关闭）
+  loss_type: "huber"                  # 损失函数类型: "mse" 或 "huber"
+  huber_delta: 0.1                  # Huber loss delta 参数
+  adam_weight_decay: 0.0            # LoRA 参数不需要 L2 正则，设为 0
+
+  # 噪声范式: "flow_matching" (Rectified Flow velocity) 或 "ddpm" (epsilon/v-prediction)
+  noise_paradigm: "ddpm"
+
+  # Flow Matching 参数 (仅 noise_paradigm=flow_matching 时生效)
+  # LoRA 域适配应使用 uniform：新域在所有噪声水平都需要适配（尤其是两端），
+  # logit_normal 集中在中间时间步，导致高噪声（全局结构）和低噪声（精细细节）更新不足
+  timestep_sampling: "logit_normal"       # "uniform" 适合 LoRA 微调, "logit_normal" 适合从零预训练
+  logit_mean: 0.0                    # logit_normal 均值（仅 logit_normal 时生效）
+  logit_std: 1.0                     # logit_normal 标准差（仅 logit_normal 时生效）
+  scheduler_shift: 1.0              # FlowMatchEulerDiscreteScheduler 的 shift 参数
+
+  # DDPM 参数 (仅 noise_paradigm=ddpm 时生效)
+  noise_offset: 0.05                # 通道级随机偏移；平面图以白底黑线为主，0.05 帮助模型学习全局亮度分布
+  min_snr_gamma: 5.0                # Min-SNR 时间步加权 (论文推荐 5.0)；抑制高噪声步的梯度噪声，LoRA 微调更稳定
+  prediction_type: "epsilon"        # "epsilon"=预测噪声(标准DDPM)，"v_prediction"=预测速度(更接近FM，可选)
+
+  # ── 空间 / 通道加权 Loss (仅 noise_paradigm=ddpm 时生效) ──
+  # 切换方式:
+  #   原版 MSE:    spatial_weight_scale=0, channel_0_weight=1.0
+  #   加权 MSE:    spatial_weight_scale=4.0, channel_0_weight=2.0
+  # 两者可独立开关，也可同时启用
+  # spatial_weight_scale: 4.0          # >0 启用空间加权: 线条权重=1+scale=5.0, 背景=1.0; 0=关闭
+  # spatial_weight_threshold: 0.1      # 亮度二值化阈值 (0~1)；黑底彩色线稿中高于此值为线条
+  # channel_0_weight: 2.0              # latent ch0 额外权重; 1.0=关闭通道加权
+
+data:
+  train_data_dir: "/home/daiqing_tan/stable_diffusion_lora/data/data/size_1024/floor"
+  resolution: 1024
+
+  # ── caption 模式 ──
+  # "fixed":     所有图片共用 caption 字段的统一提示词
+  # "per_image": 每张图片从 caption_dir 读取对应的 .txt 描述文件（结构化信息）
+  caption_mode: "per_image"
+
+  # 统一提示词（caption_mode=fixed 时生效）
+  caption: "architectural floor plan, blueprint, technical drawing"
+
+  # ── 逐图 caption 配置（caption_mode=per_image 时生效）──
+  # 训练前自动用 T5-XXL 对所有 .txt 预编码并缓存至 {train_data_dir}/../text_embed_per_image_cache/
+  caption_dir: "/home/daiqing_tan/stable_diffusion_lora/data/data/description"
+
+  # 图片文件名与描述文件名的映射规则:
+  #   图片:  ..._f1___total__1024.png
+  #   描述:  ..._f1_controlnet_color_1024.txt
+  # 将图片 stem 中的 from 替换为 to 即得到对应的描述文件 stem
+  caption_stem_replace:
+    from: "___total__1024"
+    to: "_controlnet_color_1024"
+
+  # 找不到对应描述文件时使用的兜底 caption（~3/3435 张无匹配）
+  caption_fallback: "architectural floor plan, blueprint, technical drawing"
+
+validation:
+  # ── 验证提示词来源 ──
+  # "config"  — 使用下方 prompts 列表中的固定提示词
+  # "data"    — 从训练集随机挑选 num_val_prompts 张图对应的逐图 caption
+  #             （需 caption_mode=per_image；以 seed 为随机种子，结果可复现）
+  prompt_source: "data"
+  num_val_prompts: 4                # prompt_source=data 时随机挑选的提示词数量
+
+  # 固定提示词（prompt_source=config 时生效，或 data 模式下找不到匹配时作为 fallback）
+  prompts:
+    - "architectural floor plan, blueprint, technical drawing"
+  negative_prompt: ""               # 负面提示词（空 = 不使用负面引导）
+  num_inference_steps: 50           # 推理去噪步数
+  guidance_scale: [4.5, 2.0, 1.0, 0.0]  # CFG 引导强度列表，每个值各生成一组验证图
+  seed: 42                          # 验证生图随机种子（保证可复现，同时用于随机挑图）
+  num_images_per_prompt: 2          # 每个 prompt 生成的图片数
+  # img2img_strength: [0.3, 0.5, 0.7] # img2img 噪声强度列表，用训练图做 init image 验证重建质量
+
+  # compute_fid: true
+  # fid:
+  #   num_real_images: 512
+  #   num_gen_images: 512
+  #   model_name: "dinov2_vitb14"
+  #   batch_size: 8
+  #   real_features_cache: "./outputs/pixart_sigma_lora_floorplan/fid_real_features.npz"

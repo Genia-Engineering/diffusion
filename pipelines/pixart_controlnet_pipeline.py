@@ -42,7 +42,7 @@ class PixArtControlNetPipeline(DiffusionPipeline):
     条件图像通过 VAE 或 CNN 编码到 latent 空间后注入 adapter。
     """
 
-    _optional_components = ["tokenizer", "text_encoder"]
+    _optional_components = ["tokenizer", "text_encoder", "controlnet"]
     model_cpu_offload_seq = "text_encoder->transformer->vae"
 
     def __init__(
@@ -66,10 +66,9 @@ class PixArtControlNetPipeline(DiffusionPipeline):
             text_encoder=text_encoder,
             vae=vae,
             transformer=transformer,
+            controlnet=controlnet,
             scheduler=scheduler,
         )
-        if controlnet is not None:
-            self.register_modules(controlnet=controlnet)
 
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
         self.image_processor = PixArtImageProcessor(vae_scale_factor=self.vae_scale_factor)

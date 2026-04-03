@@ -144,6 +144,12 @@ def parse_args() -> argparse.Namespace:
     i2i.add_argument("--strength", type=float, default=0.7,
                      help="img2img 噪声强度：0 附近=保留原图结构，1.0=接近纯文生图")
 
+    # 噪声范式（仅 PixArt-Sigma 有效）
+    i2i.add_argument("--noise_paradigm", type=str, default="flow_matching",
+                     choices=["flow_matching", "ddpm"],
+                     help="PixArt-Sigma 训练时使用的噪声范式：flow_matching 或 ddpm。"
+                          "决定推理 scheduler 和 img2img 加噪方式")
+
     # 系统参数
     sg = p.add_argument_group("系统参数")
     sg.add_argument("--scheduler", type=str, default="dpm_sde_karras",
@@ -384,23 +390,38 @@ def load_pipeline(args: argparse.Namespace, dtype: torch.dtype, controlnets: lis
 def _load_pixart_sigma_pipeline(args, dtype):
     """加载 PixArt-Sigma pipeline（merged 模型或基础模型 + 微调 transformer）。
 
-    训练使用 Flow Matching (Rectified Flow)，推理使用 FlowMatchEulerDiscreteScheduler
-    进行 Euler ODE 求解。
+    根据 args.noise_paradigm 选择推理 scheduler:
+      - flow_matching: FlowMatchEulerDiscreteScheduler (Euler ODE)
+      - ddpm: DPMSolverMultistepScheduler (dpmsolver++)
     """
-    from diffusers import FlowMatchEulerDiscreteScheduler, PixArtSigmaPipeline
+    from diffusers import PixArtSigmaPipeline
     from models.model_loader import load_pixart_sigma_components
+
+    use_flow_matching = getattr(args, "noise_paradigm", "flow_matching") == "flow_matching"
 
     components = load_pixart_sigma_components(
         _DEFAULT_BASE_MODELS["pixart_sigma"],
         weights_dir=args.weights_dir or None,
         dtype=dtype,
+        flow_matching=use_flow_matching,
     )
 
-    inference_scheduler = FlowMatchEulerDiscreteScheduler.from_config(
-        components["noise_scheduler"].config,
-    )
-    from models.model_loader import patch_fm_scheduler_for_pipeline
-    patch_fm_scheduler_for_pipeline(inference_scheduler)
+    if use_flow_matching:
+        from diffusers import FlowMatchEulerDiscreteScheduler
+        inference_scheduler = FlowMatchEulerDiscreteScheduler.from_config(
+            components["noise_scheduler"].config,
+        )
+        from models.model_loader import patch_fm_scheduler_for_pipeline
+        patch_fm_scheduler_for_pipeline(inference_scheduler)
+        logger.info("[PixArt-Sigma] 噪声范式: Flow Matching → FlowMatchEulerDiscreteScheduler")
+    else:
+        from diffusers import DPMSolverMultistepScheduler
+        inference_scheduler = DPMSolverMultistepScheduler.from_config(
+            components["noise_scheduler"].config,
+            algorithm_type="sde-dpmsolver++",
+            use_karras_sigmas=True,
+        )
+        logger.info("[PixArt-Sigma] 噪声范式: DDPM → DPMSolverMultistepScheduler (sde-dpmsolver++, karras)")
 
     if args.merged_model_path:
         logger.info(f"[PixArt-Sigma] 从 merged/finetuned 模型加载: {args.merged_model_path}")
@@ -422,7 +443,7 @@ def _load_pixart_sigma_pipeline(args, dtype):
         )
         return pipeline
 
-    logger.info(f"[PixArt-Sigma] 从基础模型加载")
+    logger.info("[PixArt-Sigma] 从基础模型加载")
     pipeline = PixArtSigmaPipeline(
         vae=components["vae"],
         transformer=components["transformer"],
@@ -751,14 +772,19 @@ def main():
     height = args.height if args.height > 0 else resolution
     logger.info(f"目标分辨率: {width}×{height}")
 
-    # PixArt-Sigma 参数自动适配（Flow Matching 使用 Euler ODE 推理）
+    # PixArt-Sigma 参数自动适配
     if args.model_type == "pixart_sigma":
         if args.guidance_scale == 7.5:
             args.guidance_scale = 4.5
             logger.info("PixArt-Sigma: guidance_scale 自动调整为 4.5（--guidance_scale 可覆盖）")
-        if args.scheduler in ("dpm_sde_karras", "dpm++_sde_karras", "dpm"):
-            args.scheduler = "flow_match_euler"
-            logger.info("PixArt-Sigma (Flow Matching): scheduler 自动调整为 flow_match_euler（--scheduler 可覆盖）")
+        if args.noise_paradigm == "flow_matching":
+            if args.scheduler in ("dpm_sde_karras", "dpm++_sde_karras", "dpm", "ddpm"):
+                args.scheduler = "flow_match_euler"
+                logger.info("PixArt-Sigma (Flow Matching): scheduler 自动调整为 flow_match_euler")
+        else:
+            if args.scheduler in ("flow_match_euler", "dpm_sde_karras"):
+                args.scheduler = "dpm++_sde_karras"
+                logger.info("PixArt-Sigma (DDPM): scheduler 自动调整为 dpm++_sde_karras (sde-dpmsolver++, karras)")
 
     is_img2img = bool(args.input_images)
 

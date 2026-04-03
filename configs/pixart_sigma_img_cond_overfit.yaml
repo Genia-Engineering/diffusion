@@ -16,6 +16,9 @@
 #
 # 启动方式:
 #   bash train.sh pixart_ic_overfit
+#
+# FID 评估:
+#   bash train.sh eval_fid --config configs/pixart_sigma_img_cond_overfit.yaml
 # ============================================================
 
 model:
@@ -24,11 +27,23 @@ model:
   weights_dir: "/home/daiqing_tan/stable_diffusion_lora/weights"
 
   image_encoder:
-    type: "vae"
-    dinov2_model: "facebook/dinov2-large"
-    dinov2_resolution: 518
+    type: "clip"
+    clip_model: "laion/CLIP-ViT-H-14-laion2B-s32B-b79K"
+    clip_resolution: 224
     projection_dim: 4096
-    vae_hidden_channels: [512, 2048]
+
+# LoRA 配置（可选）: 注释掉或删除此节则使用全参数微调
+lora:
+  enabled: true
+  rank: 32
+  alpha: 32
+  target_modules:
+    - "to_q"
+    - "to_k"
+    - "to_v"
+    - "to_out.0"
+    - "ff.net.0.proj"
+    - "ff.net.2"
 
 training:
   output_dir: "./outputs/pixart_img_cond_overfit"
@@ -42,14 +57,14 @@ training:
   latent_cache_batch_size: 4
   cond_dropout_prob: 0.0                    # 过拟合测试: 禁用 CFG dropout
 
-  init_dit_randomly: true                     # 不加载预训练 DiT 权重，随机初始化
+  init_dit_randomly: false                     # 不加载预训练 DiT 权重，随机初始化
 
   projector_warmup_steps: 0                  # 从第一步就联合训练
   projector_warmup_lr: 0                     # 不使用 warmup
   projector_lr: 5.0e-4                       # Projector 独立学习率 (5× transformer LR)
 
   validation_steps: 100
-  save_steps: 500
+  save_steps: 100
   keep_last_n_checkpoints: 3
   lr_warmup_steps: 50
   gradient_checkpointing: true

@@ -1,16 +1,22 @@
 """PixArt-Sigma 图像条件训练器 — 用图像编码器替代 T5 文本编码器。
 
-训练范式: Rectified Flow (Flow Matching), 与 PixArtSigmaTrainer 完全一致。
-唯一区别是 cross-attention 的条件信号来源：
+训练范式: 支持 Flow Matching 和 DDPM 双噪声范式 (通过 noise_paradigm 切换)
+  1. Flow Matching (noise_paradigm="flow_matching"):
+     Rectified Flow velocity prediction, 线性插值加噪
+  2. DDPM (noise_paradigm="ddpm"):
+     epsilon/v-prediction, scheduler.add_noise 加噪, 可选 Min-SNR 加权
+
+cross-attention 的条件信号来源：
   - 原版: T5-XXL 文本嵌入 (B, 300, 4096)
   - 本版: 图像编码器特征 (B, N, 4096)
     - VAE 模式: VAE latent → patchify Conv → (B, 256, 4096)
     - DINOv2 模式: DINOv2 features → MLP → (B, 1369, 4096)
+    - CLIP 模式: CLIP features → MLP → (B, N, 4096)
 
 训练阶段:
   1. 目标图 VAE latent 预缓存 (复用基类 _precompute_latents_distributed)
   2. 条件图特征预缓存 (_precompute_cond_features)，完成后卸载 frozen 编码器
-  3. 训练主循环: 加载缓存 → 投射层 → Transformer → Flow Matching loss
+  3. 训练主循环: 加载缓存 → 投射层 → Transformer → loss
 
 CFG (Classifier-Free Guidance):
   训练时以 cond_dropout_prob 概率将条件特征置零 (对应无条件生成)。
@@ -37,7 +43,8 @@ from data.buckets import BucketManager, BucketSampler
 from data.dataset import BaseImageDataset
 from data.img_cond_dataset import PixArtImgCondCachedLatentDataset
 from data.transforms import AspectRatioResize
-from models.image_encoder import build_image_encoder, VAEImageEncoder, DINOv2ImageEncoder
+from models.image_encoder import build_image_encoder, VAEImageEncoder, DINOv2ImageEncoder, CLIPImageEncoder
+from models.lora import LoRAInjector, LoRALinear, get_lora_params
 from models.model_loader import load_pixart_sigma_components
 from utils.ema import EMAModel
 from utils.fid import FIDCalculator
@@ -51,20 +58,45 @@ logger = logging.getLogger(__name__)
 class PixArtImgCondTrainer(BaseTrainer):
     """PixArt-Sigma 图像条件全参数微调训练器。"""
 
+    PIXART_DEFAULT_TARGET_MODULES = [
+        "to_q", "to_k", "to_v", "to_out.0",
+        "ff.net.0.proj", "ff.net.2",
+    ]
+
     def __init__(self, config: DictConfig):
         super().__init__(config)
         self.model_type = config.model.model_type
 
+        self.noise_paradigm: str = self.training_cfg.get("noise_paradigm", "flow_matching")
+
+        # Flow Matching 参数
         self.timestep_sampling: str = self.training_cfg.get("timestep_sampling", "logit_normal")
         self.logit_mean: float = float(self.training_cfg.get("logit_mean", 0.0))
         self.logit_std: float = float(self.training_cfg.get("logit_std", 1.0))
+
+        # DDPM 参数
+        self.noise_offset: float = float(self.training_cfg.get("noise_offset", 0.0))
+        self.min_snr_gamma: float = float(self.training_cfg.get("min_snr_gamma", 0.0))
+
         self.cond_dropout_prob: float = float(self.training_cfg.get("cond_dropout_prob", 0.1))
 
         self.img_enc_cfg = config.model.get("image_encoder", {})
         self.img_enc_type: str = self.img_enc_cfg.get("type", "dinov2")
 
+        self.lora_cfg = config.get("lora", None)
+        self.use_lora: bool = self.lora_cfg is not None and self.lora_cfg.get("enabled", True)
+
         self._load_models()
+        if self.use_lora:
+            self._inject_lora()
         self._freeze_parameters()
+        self._patch_caption_projection_layernorm()
+
+        # DDPM Min-SNR 加权需要 SNR 查找表
+        self._snr_cache: torch.Tensor | None = None
+        if self.noise_paradigm == "ddpm" and self.min_snr_gamma > 0:
+            alphas_cumprod = self.noise_scheduler.alphas_cumprod
+            self._snr_cache = alphas_cumprod / (1.0 - alphas_cumprod)
 
         apply_memory_optimizations(
             transformer=self.transformer,
@@ -81,11 +113,13 @@ class PixArtImgCondTrainer(BaseTrainer):
         weights_dir = self.config.model.get("weights_dir", None)
         scheduler_shift = float(self.training_cfg.get("scheduler_shift", 1.0))
         init_dit_randomly = self.training_cfg.get("init_dit_randomly", False)
+        use_flow_matching = self.noise_paradigm == "flow_matching"
 
         components = load_pixart_sigma_components(
             model_path, weights_dir=weights_dir, scheduler_shift=scheduler_shift,
             load_text_encoder=False,
             init_transformer_randomly=init_dit_randomly,
+            flow_matching=use_flow_matching,
         )
         self.vae = components["vae"]
         self.transformer = components["transformer"]
@@ -93,12 +127,49 @@ class PixArtImgCondTrainer(BaseTrainer):
         self.text_encoder = None
         self.tokenizer = None
 
+        if not use_flow_matching:
+            override_pred_type = self.training_cfg.get("prediction_type", None)
+            if override_pred_type and override_pred_type != self.noise_scheduler.config.prediction_type:
+                self.noise_scheduler.register_to_config(prediction_type=override_pred_type)
+                logger.info(f"DDPM prediction_type overridden to '{override_pred_type}'")
+            logger.info(
+                f"噪声范式: DDPM (prediction_type={self.noise_scheduler.config.prediction_type})"
+            )
+        else:
+            logger.info("噪声范式: Flow Matching (Rectified Flow, sigma velocity)")
+
         enc_result = build_image_encoder(self.img_enc_cfg)
         self.image_encoder: nn.Module = enc_result["encoder"]
 
+    def _inject_lora(self):
+        """向 Transformer 注入 LoRA 层。"""
+        rank = self.lora_cfg.get("rank", 64)
+        alpha = self.lora_cfg.get("alpha", 64.0)
+        target_modules = list(
+            self.lora_cfg.get("target_modules", self.PIXART_DEFAULT_TARGET_MODULES)
+        )
+        injected = LoRAInjector.inject(self.transformer, rank, alpha, target_modules)
+        logger.info(
+            f"LoRA injected into PixArt Transformer: {len(injected)} layers, "
+            f"rank={rank}, alpha={alpha}"
+        )
+
     def _freeze_parameters(self):
         self.vae.requires_grad_(False)
-        self.transformer.requires_grad_(True)
+
+        if self.use_lora:
+            for param in self.transformer.parameters():
+                param.requires_grad = False
+            for module in self.transformer.modules():
+                if isinstance(module, LoRALinear):
+                    module.lora_A.requires_grad_(True)
+                    module.lora_B.requires_grad_(True)
+            if hasattr(self.transformer, "caption_projection"):
+                self.transformer.caption_projection.requires_grad_(True)
+            logger.info("Transformer: frozen (LoRA + caption_projection trainable)")
+        else:
+            self.transformer.requires_grad_(True)
+            logger.info("Transformer: full fine-tuning")
 
         if isinstance(self.image_encoder, VAEImageEncoder):
             self.image_encoder.requires_grad_(True)
@@ -107,8 +178,18 @@ class PixArtImgCondTrainer(BaseTrainer):
             self.image_encoder.backbone.requires_grad_(False)
             self.image_encoder.projection.requires_grad_(True)
             logger.info("DINOv2 backbone: frozen, projection: trainable")
+        elif isinstance(self.image_encoder, CLIPImageEncoder):
+            self.image_encoder.backbone.requires_grad_(False)
+            self.image_encoder.projection.requires_grad_(True)
+            logger.info("CLIP backbone: frozen, projection: trainable")
 
         self.print_trainable_params(self.transformer, self.image_encoder)
+
+    def _patch_caption_projection_layernorm(self):
+        """Inject LayerNorm into caption_projection to prevent bf16 overflow."""
+        from utils.memory import patch_caption_projection_layernorm
+        if patch_caption_projection_layernorm(self.transformer):
+            self.transformer.caption_projection.norm.requires_grad_(True)
 
     # ── 条件特征预缓存 ──────────────────────────────────────────────
 
@@ -126,6 +207,7 @@ class PixArtImgCondTrainer(BaseTrainer):
         VAE 模式: 条件图 → VAE encode → latent (4, H/8, W/8)
                   需要按目标桶尺寸 resize 以保持空间对齐
         DINOv2 模式: 条件图 → resize to fixed res → DINOv2 → features (N, 1024)
+        CLIP 模式: 条件图 → resize to fixed res → CLIP → hidden_states[-2] (N, 1280)
         """
         from data.controlnet_dataset import _build_cond_index, _KNOWN_SUFFIX_PAIRS, _strip_known_suffix
 
@@ -181,6 +263,11 @@ class PixArtImgCondTrainer(BaseTrainer):
                 self._cache_vae_cond_features(
                     todo_indices, train_images, index_to_bucket, cond_index,
                     cache_dir, center_crop, vae_batch_size, device,
+                )
+            elif self.img_enc_type == "clip":
+                self._cache_clip_cond_features(
+                    todo_indices, train_images, cond_index,
+                    cache_dir, device, vae_batch_size,
                 )
             else:
                 self._cache_dinov2_cond_features(
@@ -333,6 +420,83 @@ class PixArtImgCondTrainer(BaseTrainer):
                     features = encoder(inputs).last_hidden_state[:, 1:, :]
                     features = features.to(torch.float16).cpu()
                     features_flip = encoder(inputs_flip).last_hidden_state[:, 1:, :]
+                    features_flip = features_flip.to(torch.float16).cpu()
+
+                for j, bk in enumerate(base_keys):
+                    torch.save(
+                        {"features": features[j], "features_flip": features_flip[j]},
+                        cache_dir / f"{bk}.pt",
+                    )
+                pbar.update(len(batch_indices))
+
+        encoder.cpu()
+        torch.cuda.empty_cache()
+
+    def _cache_clip_cond_features(
+        self, todo_indices, train_images, cond_index,
+        cache_dir, device, batch_size,
+    ):
+        """CLIP 模式：编码条件图为 patch features (hidden_states[-2])。"""
+        from data.controlnet_dataset import _strip_known_suffix, _KNOWN_SUFFIX_PAIRS
+        from transformers import CLIPImageProcessor
+
+        assert isinstance(self.image_encoder, CLIPImageEncoder)
+        encoder = self.image_encoder.backbone.to(device)
+        encoder.eval()
+
+        clip_model_name = self.img_enc_cfg.get(
+            "clip_model", "laion/CLIP-ViT-H-14-laion2B-s32B-b79K"
+        )
+        processor = CLIPImageProcessor.from_pretrained(clip_model_name)
+        resolution = self.img_enc_cfg.get("clip_resolution", 224)
+
+        with tqdm(
+            total=len(todo_indices),
+            desc=f"[Rank {self.accelerator.process_index}] CLIP cond cache",
+            disable=not self.accelerator.is_main_process,
+        ) as pbar:
+            for batch_start in range(0, len(todo_indices), batch_size):
+                batch_indices = todo_indices[batch_start:batch_start + batch_size]
+                images_pil, images_pil_flip, base_keys = [], [], []
+
+                for idx in batch_indices:
+                    fname = train_images[idx].name
+                    bk = None
+                    for orig_suffix, _ in _KNOWN_SUFFIX_PAIRS:
+                        bk = _strip_known_suffix(fname, orig_suffix)
+                        if bk is not None:
+                            break
+                    if bk is None:
+                        bk = Path(fname).stem
+                    base_keys.append(bk)
+
+                    cond_path = cond_index.get(bk)
+                    if cond_path is None:
+                        raise FileNotFoundError(
+                            f"条件图未找到: base_key='{bk}' (target: {fname})"
+                        )
+
+                    cond_img = Image.open(cond_path).convert("RGB")
+                    if resolution is not None:
+                        cond_img = cond_img.resize(
+                            (resolution, resolution), Image.LANCZOS
+                        )
+                    images_pil.append(cond_img)
+                    images_pil_flip.append(TF.hflip(cond_img))
+
+                inputs = processor(
+                    images=images_pil, return_tensors="pt"
+                ).pixel_values.to(device)
+                inputs_flip = processor(
+                    images=images_pil_flip, return_tensors="pt"
+                ).pixel_values.to(device)
+
+                with torch.no_grad():
+                    out = encoder(inputs, output_hidden_states=True)
+                    features = out.hidden_states[-2][:, 1:, :]
+                    features = features.to(torch.float16).cpu()
+                    out_flip = encoder(inputs_flip, output_hidden_states=True)
+                    features_flip = out_flip.hidden_states[-2][:, 1:, :]
                     features_flip = features_flip.to(torch.float16).cpu()
 
                 for j, bk in enumerate(base_keys):
@@ -535,6 +699,9 @@ class PixArtImgCondTrainer(BaseTrainer):
         if self.img_enc_type == "dinov2":
             assert isinstance(self.image_encoder, DINOv2ImageEncoder)
             self.image_encoder.backbone.to(self.accelerator.device)
+        elif self.img_enc_type == "clip":
+            assert isinstance(self.image_encoder, CLIPImageEncoder)
+            self.image_encoder.backbone.to(self.accelerator.device)
 
         self._precompute_cond_features(bucket_to_indices)
 
@@ -550,12 +717,12 @@ class PixArtImgCondTrainer(BaseTrainer):
         val_cond_raw_features = self._broadcast_tensor_list(val_cond_raw_features)
 
         # 卸载 frozen 编码器
-        if self.img_enc_type == "dinov2":
+        if self.img_enc_type in ("dinov2", "clip"):
             if hasattr(self.image_encoder, "backbone") and self.image_encoder.backbone is not None:
                 del self.image_encoder.backbone
                 self.image_encoder.backbone = None
             torch.cuda.empty_cache()
-            logger.info("DINOv2 backbone 已卸载")
+            logger.info(f"{self.img_enc_type.upper()} backbone 已卸载")
 
         if hasattr(self.vae, "encoder"):
             del self.vae.encoder
@@ -576,23 +743,31 @@ class PixArtImgCondTrainer(BaseTrainer):
         # projector 统一使用 self.image_encoder（forward 均返回 (embeds, mask) 元组）
         # VAEImageEncoder.forward(latent_4d) → (B, N, 4096), (B, N)
         # DINOv2ImageEncoder.forward(features_3d) → (B, N, 4096), (B, N)
+        # CLIPImageEncoder.forward(features_3d) → (B, N, 4096), (B, N)
         #   backbone 已卸载 (=None)，forward 只走 self.projection，不需要 backbone
         projector = self.image_encoder
 
         caption_proj_ids = set()
         if hasattr(self.transformer, "caption_projection"):
             caption_proj_ids = {id(p) for p in self.transformer.caption_projection.parameters()}
-        transformer_params = [
-            p for p in self.transformer.parameters()
-            if p.requires_grad and id(p) not in caption_proj_ids
-        ]
+
+        if self.use_lora:
+            transformer_params = get_lora_params(self.transformer)
+        else:
+            transformer_params = [
+                p for p in self.transformer.parameters()
+                if p.requires_grad and id(p) not in caption_proj_ids
+            ]
+
         caption_proj_params = [
             p for p in self.transformer.caption_projection.parameters()
             if p.requires_grad
         ] if caption_proj_ids else []
 
-        if isinstance(self.image_encoder, DINOv2ImageEncoder):
+        if isinstance(self.image_encoder, (DINOv2ImageEncoder, CLIPImageEncoder)):
             projector_params = [p for p in self.image_encoder.projection.parameters() if p.requires_grad]
+            if hasattr(self.image_encoder, "output_norm"):
+                projector_params += [p for p in self.image_encoder.output_norm.parameters() if p.requires_grad]
         else:
             projector_params = [p for p in self.image_encoder.parameters() if p.requires_grad]
         projector_params = projector_params + caption_proj_params
@@ -638,7 +813,7 @@ class PixArtImgCondTrainer(BaseTrainer):
                 transformer=self.accelerator.unwrap_model(self.transformer),
                 optimizer=optimizer,
                 lr_scheduler=None,
-                is_lora=False,
+                is_lora=self.use_lora,
             )
             self.global_step = state["step"]
             self.global_epoch = state["epoch"]
@@ -652,6 +827,18 @@ class PixArtImgCondTrainer(BaseTrainer):
                     torch.load(projector_ckpt, map_location=self.accelerator.device, weights_only=True)
                 )
                 logger.info(f"Projector weights loaded from {projector_ckpt}")
+
+            cp_ckpt = os.path.join(resume_dir, "caption_projection.pt")
+            if os.path.exists(cp_ckpt):
+                unwrapped_tf = self.accelerator.unwrap_model(self.transformer)
+                if hasattr(unwrapped_tf, "caption_projection"):
+                    result = unwrapped_tf.caption_projection.load_state_dict(
+                        torch.load(cp_ckpt, map_location=self.accelerator.device, weights_only=True),
+                        strict=False,
+                    )
+                    logger.info(f"caption_projection weights loaded from {cp_ckpt}")
+                    if result.missing_keys:
+                        logger.info(f"  missing keys (will use init): {result.missing_keys}")
 
             if use_ema:
                 ema_tf_path = os.path.join(resume_dir, "ema_transformer.pt")
@@ -733,6 +920,9 @@ class PixArtImgCondTrainer(BaseTrainer):
             )
 
         epoch_offset = self.global_epoch
+        grad_norm = None
+        tf_grad_norm_val = None
+        proj_grad_norm_val = None
         for epoch in range(num_epochs):
             self.global_epoch = epoch_offset + epoch
             for batch in dataloader:
@@ -741,17 +931,25 @@ class PixArtImgCondTrainer(BaseTrainer):
 
                 with self.accelerator.accumulate(self.transformer, projector):
                     loss = self._training_step(batch, projector)
+
+                    nan_detected = torch.isnan(loss) or torch.isinf(loss)
+                    if nan_detected:
+                        optimizer.zero_grad()
+                        continue
+
                     self.accelerator.backward(loss)
 
                     if self.accelerator.sync_gradients:
                         if self.global_step < projector_warmup_steps:
-                            unwrapped_tf = self.accelerator.unwrap_model(self.transformer)
-                            warmup_skip = caption_proj_ids
-                            for p in unwrapped_tf.parameters():
-                                if p.grad is not None and id(p) not in warmup_skip:
+                            for p in transformer_params:
+                                if p.grad is not None:
                                     p.grad.zero_()
 
-                        grad_norm = self.accelerator.clip_grad_norm_(trainable_params, max_grad_norm)
+                        tf_grad_norm = torch.nn.utils.clip_grad_norm_(transformer_params, max_grad_norm)
+                        proj_grad_norm = torch.nn.utils.clip_grad_norm_(projector_params, max_grad_norm)
+                        grad_norm = (tf_grad_norm ** 2 + proj_grad_norm ** 2) ** 0.5
+                        tf_grad_norm_val = tf_grad_norm.item() if hasattr(tf_grad_norm, 'item') else float(tf_grad_norm)
+                        proj_grad_norm_val = proj_grad_norm.item() if hasattr(proj_grad_norm, 'item') else float(proj_grad_norm)
                         grad_norm = grad_norm.item() if hasattr(grad_norm, 'item') else float(grad_norm)
 
                     optimizer.step()
@@ -769,7 +967,13 @@ class PixArtImgCondTrainer(BaseTrainer):
                         optimizer.param_groups[1]['lr'] = projector_warmup_lr
 
                     current_lr = lr_scheduler.get_last_lr()[0]
-                    self.log_step(loss.item(), current_lr, grad_norm)
+                    current_proj_lr = optimizer.param_groups[1]['lr'] if len(optimizer.param_groups) > 1 else None
+                    self.log_step(
+                        loss.item(), current_lr, grad_norm,
+                        projector_lr=current_proj_lr,
+                        tf_grad_norm=tf_grad_norm_val,
+                        proj_grad_norm=proj_grad_norm_val,
+                    )
 
                     if self.global_step == projector_warmup_steps and projector_warmup_steps > 0:
                         joint_proj_lr = optimizer.param_groups[1]['lr']
@@ -823,13 +1027,47 @@ class PixArtImgCondTrainer(BaseTrainer):
     # ── 训练步 ───────────────────────────────────────────────────────
 
     def _training_step(self, batch, projector: nn.Module) -> torch.Tensor:
-        """单步 Flow Matching 训练（图像条件版）。"""
+        """单步训练，根据 noise_paradigm 分发到 Flow Matching 或 DDPM 路径。"""
         latents = batch["latents"].to(self.accelerator.device)
         cond_features = batch["cond_features"].to(self.accelerator.device)
         bsz = latents.shape[0]
 
         noise = torch.randn_like(latents)
 
+        # 投射层: cond_features → encoder_hidden_states (B, N, 4096)
+        prompt_embeds, attention_mask = projector(cond_features)
+
+        # CFG dropout: 在投射层之后将条件特征置零，确保训练/推理一致
+        # （投射层含 Conv2d bias，零输入会产生非零输出，故 dropout 须在投射后执行）
+        if self.transformer.training and self.cond_dropout_prob > 0:
+            drop_mask = torch.rand(bsz, device=latents.device) < self.cond_dropout_prob
+            if drop_mask.any():
+                prompt_embeds = prompt_embeds.clone()
+                prompt_embeds[drop_mask] = 0.0
+
+        unwrapped_tf = self.accelerator.unwrap_model(self.transformer)
+        if hasattr(unwrapped_tf, "caption_projection"):
+            caption_proj_out = unwrapped_tf.caption_projection(prompt_embeds)
+            if torch.isnan(caption_proj_out).any() or torch.isinf(caption_proj_out).any():
+                logger.warning(
+                    f"[Step {self.global_step}] caption_projection overflow! "
+                    f"input(prompt_embeds): min={prompt_embeds.min().item():.4f}, "
+                    f"max={prompt_embeds.max().item():.4f}, "
+                    f"output: min={caption_proj_out.min().item():.4f}, "
+                    f"max={caption_proj_out.max().item():.4f}, "
+                    f"has_nan={torch.isnan(caption_proj_out).any().item()}, "
+                    f"has_inf={torch.isinf(caption_proj_out).any().item()}"
+                )
+
+        if self.noise_paradigm == "flow_matching":
+            return self._training_step_fm(latents, noise, bsz, prompt_embeds, attention_mask)
+        else:
+            return self._training_step_ddpm(latents, noise, bsz, prompt_embeds, attention_mask)
+
+    def _training_step_fm(
+        self, latents, noise, bsz, prompt_embeds, attention_mask,
+    ) -> torch.Tensor:
+        """Flow Matching 训练步: 线性插值 → velocity prediction → MSE loss。"""
         if self.timestep_sampling == "logit_normal":
             t = torch.sigmoid(
                 self.logit_mean + self.logit_std * torch.randn(bsz, device=latents.device)
@@ -839,16 +1077,6 @@ class PixArtImgCondTrainer(BaseTrainer):
 
         t_expanded = t.view(-1, 1, 1, 1)
         noisy_latents = t_expanded * latents + (1.0 - t_expanded) * noise
-
-        # CFG dropout: 以 cond_dropout_prob 概率将条件特征置零
-        if self.transformer.training and self.cond_dropout_prob > 0:
-            drop_mask = torch.rand(bsz, device=latents.device) < self.cond_dropout_prob
-            if drop_mask.any():
-                cond_features[drop_mask] = 0.0
-
-        # 投射层: cond_features → encoder_hidden_states (B, N, 4096)
-        prompt_embeds, attention_mask = projector(cond_features)
-
         timesteps_scaled = (1.0 - t) * 1000.0
 
         model_output = self.transformer(
@@ -875,6 +1103,56 @@ class PixArtImgCondTrainer(BaseTrainer):
 
         return loss
 
+    def _training_step_ddpm(
+        self, latents, noise, bsz, prompt_embeds, attention_mask,
+    ) -> torch.Tensor:
+        """DDPM 训练步: scheduler.add_noise → epsilon/v-prediction → weighted MSE loss。"""
+        if self.noise_offset > 0:
+            noise = noise + self.noise_offset * torch.randn(
+                latents.shape[0], latents.shape[1], 1, 1,
+                device=latents.device, dtype=latents.dtype,
+            )
+
+        timesteps = torch.randint(
+            0, self.noise_scheduler.config.num_train_timesteps, (bsz,),
+            device=latents.device,
+        ).long()
+
+        noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
+
+        model_output = self.transformer(
+            hidden_states=noisy_latents,
+            timestep=timesteps,
+            encoder_hidden_states=prompt_embeds,
+            encoder_attention_mask=attention_mask,
+        ).sample
+
+        if model_output.shape[1] != latents.shape[1]:
+            model_output, _ = model_output.chunk(2, dim=1)
+
+        if self.noise_scheduler.config.prediction_type == "v_prediction":
+            target = self.noise_scheduler.get_velocity(latents, noise, timesteps)
+        else:
+            target = noise
+
+        loss = self.compute_loss(
+            model_output, target, timesteps,
+            snr_cache=self._snr_cache,
+            min_snr_gamma=self.min_snr_gamma,
+            prediction_type=self.noise_scheduler.config.prediction_type,
+        )
+
+        if torch.isnan(loss):
+            logger.warning(
+                f"[Step {self.global_step}] NaN loss detected! "
+                f"model_output: min={model_output.min().item():.4f}, max={model_output.max().item():.4f}, "
+                f"has_nan={torch.isnan(model_output).any().item()}, "
+                f"prompt_embeds: min={prompt_embeds.min().item():.4f}, max={prompt_embeds.max().item():.4f}, "
+                f"has_nan={torch.isnan(prompt_embeds).any().item()}"
+            )
+
+        return loss
+
     # ── 验证 ─────────────────────────────────────────────────────────
 
     @torch.no_grad()
@@ -886,11 +1164,12 @@ class PixArtImgCondTrainer(BaseTrainer):
         返回:
             VAE 模式: (N, 4, H/8, W/8) — VAE latent (尚未经 projector)
             DINOv2 模式: (N, seq_len, 1024) — backbone features (尚未经 projection)
+            CLIP 模式: (N, seq_len, 1280) — backbone features (尚未经 projection)
         """
         device = self.accelerator.device
         all_features = []
 
-        if self.img_enc_type == "dinov2":
+        if self.img_enc_type in ("dinov2", "clip"):
             self.image_encoder.backbone.to(device)
 
         use_slicing = getattr(self.vae, "use_slicing", False)
@@ -904,6 +1183,22 @@ class PixArtImgCondTrainer(BaseTrainer):
         normalize = T.Normalize([0.5], [0.5])
         bucket_manager = BucketManager(model_type=self.model_type)
 
+        processor = None
+        resolution = None
+        if self.img_enc_type == "clip":
+            from transformers import CLIPImageProcessor
+            clip_model_name = self.img_enc_cfg.get(
+                "clip_model", "laion/CLIP-ViT-H-14-laion2B-s32B-b79K"
+            )
+            processor = CLIPImageProcessor.from_pretrained(clip_model_name)
+            resolution = self.img_enc_cfg.get("clip_resolution", 224)
+        elif self.img_enc_type == "dinov2":
+            from transformers import AutoImageProcessor
+            processor = AutoImageProcessor.from_pretrained(
+                self.img_enc_cfg.get("dinov2_model", "facebook/dinov2-large")
+            )
+            resolution = self.img_enc_cfg.get("dinov2_resolution", 518)
+
         for img in cond_images:
             if self.img_enc_type == "vae":
                 w, h = img.size
@@ -916,11 +1211,6 @@ class PixArtImgCondTrainer(BaseTrainer):
                 latent = latent * self.vae.config.scaling_factor
                 all_features.append(latent.cpu())
             else:
-                from transformers import AutoImageProcessor
-                processor = AutoImageProcessor.from_pretrained(
-                    self.img_enc_cfg.get("dinov2_model", "facebook/dinov2-large")
-                )
-                resolution = self.img_enc_cfg.get("dinov2_resolution", 518)
                 img_resized = img.resize((resolution, resolution), Image.LANCZOS)
                 inputs = processor(
                     images=[img_resized], return_tensors="pt"
@@ -933,7 +1223,7 @@ class PixArtImgCondTrainer(BaseTrainer):
         if use_tiling:
             self.vae.enable_tiling()
 
-        if self.img_enc_type == "dinov2":
+        if self.img_enc_type in ("dinov2", "clip"):
             self.image_encoder.backbone.cpu()
             torch.cuda.empty_cache()
 
@@ -945,8 +1235,7 @@ class PixArtImgCondTrainer(BaseTrainer):
         val_cond_raw_features,
     ):
         """图像条件验证：用预编码的原始特征 → projector → pipeline。"""
-        from diffusers import FlowMatchEulerDiscreteScheduler, PixArtSigmaPipeline
-        from models.model_loader import patch_fm_scheduler_for_pipeline
+        from diffusers import PixArtSigmaPipeline
 
         self.transformer.eval()
         projector.eval()
@@ -955,10 +1244,20 @@ class PixArtImgCondTrainer(BaseTrainer):
         if hasattr(unwrapped_transformer, "_orig_mod"):
             unwrapped_transformer = unwrapped_transformer._orig_mod
 
-        inference_scheduler = FlowMatchEulerDiscreteScheduler.from_config(
-            self.noise_scheduler.config
-        )
-        patch_fm_scheduler_for_pipeline(inference_scheduler)
+        if self.noise_paradigm == "flow_matching":
+            from diffusers import FlowMatchEulerDiscreteScheduler
+            from models.model_loader import patch_fm_scheduler_for_pipeline
+            inference_scheduler = FlowMatchEulerDiscreteScheduler.from_config(
+                self.noise_scheduler.config
+            )
+            patch_fm_scheduler_for_pipeline(inference_scheduler)
+        else:
+            from diffusers import DPMSolverMultistepScheduler
+            inference_scheduler = DPMSolverMultistepScheduler.from_config(
+                self.noise_scheduler.config,
+                algorithm_type="sde-dpmsolver++",
+                use_karras_sigmas=True,
+            )
 
         pipeline = PixArtSigmaPipeline(
             vae=self.vae,
@@ -1015,12 +1314,12 @@ class PixArtImgCondTrainer(BaseTrainer):
         self.ckpt_manager.save(
             step=self.global_step,
             global_epoch=self.global_epoch,
-            transformer=self.transformer,
+            transformer=self.accelerator.unwrap_model(self.transformer),
             accelerator=self.accelerator,
             optimizer=optimizer,
             lr_scheduler=lr_scheduler,
             seed=self.training_cfg.get("seed", 42),
-            is_lora=False,
+            is_lora=self.use_lora,
         )
 
         ckpt_dir = self.ckpt_manager.get_latest_checkpoint()
@@ -1029,6 +1328,12 @@ class PixArtImgCondTrainer(BaseTrainer):
             unwrapped_proj = self.accelerator.unwrap_model(projector)
             torch.save(unwrapped_proj.state_dict(), projector_path)
             logger.info(f"Projector weights saved to {projector_path}")
+
+            unwrapped_tf = self.accelerator.unwrap_model(self.transformer)
+            if hasattr(unwrapped_tf, "caption_projection"):
+                cp_path = os.path.join(ckpt_dir, "caption_projection.pt")
+                torch.save(unwrapped_tf.caption_projection.state_dict(), cp_path)
+                logger.info(f"caption_projection weights saved to {cp_path}")
 
             if ema_transformer is not None:
                 torch.save(ema_transformer.state_dict(), os.path.join(ckpt_dir, "ema_transformer.pt"))

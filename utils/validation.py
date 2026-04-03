@@ -98,7 +98,11 @@ class ValidationLoop:
         self.prompts = prompts
         self.negative_prompt = negative_prompt
         self.num_inference_steps = num_inference_steps
-        self.guidance_scale = guidance_scale
+        if isinstance(guidance_scale, (int, float)):
+            self.guidance_scales = [float(guidance_scale)]
+        else:
+            self.guidance_scales = [float(s) for s in guidance_scale]
+        self.guidance_scale = self.guidance_scales[0]
         self.seed = seed
         self.num_images_per_prompt = num_images_per_prompt
         self.save_dir = Path(save_dir)
@@ -155,8 +159,6 @@ class ValidationLoop:
             step_dir = self.save_dir / f"step_{step:06d}"
             step_dir.mkdir(parents=True, exist_ok=True)
 
-            generator = torch.Generator(device=device or "cpu").manual_seed(self.seed)
-
             use_embeds = (
                 pipeline_kwargs_override is not None
                 and (
@@ -165,46 +167,57 @@ class ValidationLoop:
                 )
             )
 
-            for i, prompt in enumerate(self.prompts):
-                kwargs = {
-                    "num_inference_steps": self.num_inference_steps,
-                    "guidance_scale": self.guidance_scale,
-                    "generator": generator,
-                    "num_images_per_prompt": self.num_images_per_prompt,
-                }
-                if use_embeds:
-                    kwargs["prompt"] = None
-                    kwargs["negative_prompt"] = None
-                    if isinstance(pipeline_kwargs_override, list):
-                        kwargs.update(pipeline_kwargs_override[i % len(pipeline_kwargs_override)])
+            multi_cfg = len(self.guidance_scales) > 1
+
+            for cfg_scale in self.guidance_scales:
+                cfg_tag = f"cfg{cfg_scale:g}_" if multi_cfg else ""
+                generator = torch.Generator(device="cpu").manual_seed(self.seed)
+                scale_images: list[Image.Image] = []
+
+                for i, prompt in enumerate(self.prompts):
+                    kwargs = {
+                        "num_inference_steps": self.num_inference_steps,
+                        "guidance_scale": cfg_scale,
+                        "generator": generator,
+                        "num_images_per_prompt": self.num_images_per_prompt,
+                    }
+                    if use_embeds:
+                        kwargs["prompt"] = None
+                        kwargs["negative_prompt"] = None
+                        if isinstance(pipeline_kwargs_override, list):
+                            kwargs.update(pipeline_kwargs_override[i % len(pipeline_kwargs_override)])
+                        else:
+                            for k, v in pipeline_kwargs_override.items():
+                                if isinstance(v, torch.Tensor) and v.shape[0] > 1:
+                                    kwargs[k] = v[i % v.shape[0] : i % v.shape[0] + 1]
+                                else:
+                                    kwargs[k] = v
                     else:
-                        for k, v in pipeline_kwargs_override.items():
-                            if isinstance(v, torch.Tensor) and v.shape[0] > 1:
-                                kwargs[k] = v[i % v.shape[0] : i % v.shape[0] + 1]
-                            else:
-                                kwargs[k] = v
-                else:
-                    kwargs["prompt"] = prompt
-                    kwargs["negative_prompt"] = self.negative_prompt
-                    if pipeline_kwargs_override:
-                        kwargs.update(pipeline_kwargs_override)
+                        kwargs["prompt"] = prompt
+                        kwargs["negative_prompt"] = self.negative_prompt
+                        if pipeline_kwargs_override:
+                            kwargs.update(pipeline_kwargs_override)
 
-                if conditioning_images is not None and i < len(conditioning_images):
-                    kwargs["image"] = conditioning_images[i]
-                    kwargs["controlnet_conditioning_scale"] = self.controlnet_conditioning_scale
+                    if conditioning_images is not None and i < len(conditioning_images):
+                        kwargs["image"] = conditioning_images[i]
+                        kwargs["controlnet_conditioning_scale"] = self.controlnet_conditioning_scale
 
-                output = pipeline(**kwargs)
-                for j, img in enumerate(output.images):
-                    img.save(step_dir / f"prompt_{i:02d}_img_{j:02d}.png")
-                    all_images.append(img)
+                    output = pipeline(**kwargs)
+                    for j, img in enumerate(output.images):
+                        img.save(step_dir / f"{cfg_tag}prompt_{i:02d}_img_{j:02d}.png")
+                        all_images.append(img)
+                        scale_images.append(img)
 
-                    cond_img = conditioning_images[i] if conditioning_images and i < len(conditioning_images) else None
-                    gt_img = ground_truth_images[i] if ground_truth_images and i < len(ground_truth_images) else None
+                        cond_img = conditioning_images[i] if conditioning_images and i < len(conditioning_images) else None
+                        gt_img = ground_truth_images[i] if ground_truth_images and i < len(ground_truth_images) else None
 
-                    if cond_img is not None or gt_img is not None:
-                        grid = _make_comparison_grid(img, cond_img, gt_img)
-                        grid.save(step_dir / f"compare_{i:02d}_img_{j:02d}.png")
-                        comparison_grids.append(grid)
+                        if cond_img is not None or gt_img is not None:
+                            grid = _make_comparison_grid(img, cond_img, gt_img)
+                            grid.save(step_dir / f"{cfg_tag}compare_{i:02d}_img_{j:02d}.png")
+                            comparison_grids.append(grid)
+
+                if multi_cfg and scale_images:
+                    tb_logger.log_images(f"validation/samples_cfg{cfg_scale:g}", scale_images, step)
 
             # ── img2img：每个 strength 独立生成一组，保存为 s{strength}_* ──────
             if img2img_data:
@@ -220,7 +233,7 @@ class ValidationLoop:
                         for i, prompt in enumerate(self.prompts):
                             i2i_kwargs = {
                                 "guidance_scale": self.guidance_scale,
-                                "generator": torch.Generator(device=device or "cpu").manual_seed(self.seed + i),
+                                "generator": torch.Generator(device="cpu").manual_seed(self.seed + i),
                                 # img2img 传入自定义 latents（batch=1），必须用 num_images_per_prompt=1
                                 # 否则 text embeds 被重复 4× 后与 latents batch 不匹配，
                                 # 导致 Transformer cross-attention 内部 reshape 出错
@@ -261,7 +274,8 @@ class ValidationLoop:
                 if all_img2img:
                     tb_logger.log_images("validation/img2img", all_img2img, step)
 
-            tb_logger.log_images("validation/samples", all_images, step)
+            if not multi_cfg:
+                tb_logger.log_images("validation/samples", all_images, step)
             if comparison_grids:
                 tb_logger.log_images("validation/comparisons", comparison_grids, step)
             tb_logger.flush()
@@ -371,14 +385,24 @@ class ValidationLoop:
         """
         fid_images: list[Image.Image] = []
         prompt_cycle = self.prompts * (num_images // len(self.prompts) + 1)
-        use_embeds = pipeline_kwargs_override and "prompt_embeds" in pipeline_kwargs_override
-        gen_device = device or "cpu"
+        gen_device = "cpu"
+
+        per_image_overrides: list[dict] | None = None
+        single_override: dict | None = None
+        if isinstance(pipeline_kwargs_override, list) and len(pipeline_kwargs_override) > 0:
+            per_image_overrides = pipeline_kwargs_override
+        elif isinstance(pipeline_kwargs_override, dict):
+            single_override = pipeline_kwargs_override
+
+        use_embeds = (
+            (per_image_overrides is not None and "prompt_embeds" in per_image_overrides[0])
+            or (single_override is not None and "prompt_embeds" in single_override)
+        )
 
         for batch_start in range(0, num_images, self.fid_batch_size):
             batch_indices = list(range(batch_start, min(batch_start + self.fid_batch_size, num_images)))
             actual_bs = len(batch_indices)
 
-            # 每张图配置独立 Generator，保持与逐张生成时完全相同的随机性
             generators = [
                 torch.Generator(device=gen_device).manual_seed(
                     self.seed + seed_offset + idx + 10000
@@ -396,17 +420,29 @@ class ValidationLoop:
             if use_embeds:
                 kwargs["prompt"] = None
                 kwargs["negative_prompt"] = None
-                for k, v in pipeline_kwargs_override.items():
-                    if isinstance(v, torch.Tensor) and v.shape[0] != actual_bs:
-                        repeats = (actual_bs + v.shape[0] - 1) // v.shape[0]
-                        kwargs[k] = v.repeat(repeats, *([1] * (v.dim() - 1)))[:actual_bs]
-                    else:
-                        kwargs[k] = v
+
+                if per_image_overrides is not None:
+                    n_overrides = len(per_image_overrides)
+                    batch_override: dict = {}
+                    for k in per_image_overrides[0].keys():
+                        vals = [per_image_overrides[idx % n_overrides][k] for idx in batch_indices]
+                        if isinstance(vals[0], torch.Tensor):
+                            batch_override[k] = torch.cat(vals, dim=0)
+                        else:
+                            batch_override[k] = vals[0]
+                    kwargs.update(batch_override)
+                elif single_override is not None:
+                    for k, v in single_override.items():
+                        if isinstance(v, torch.Tensor) and v.shape[0] != actual_bs:
+                            repeats = (actual_bs + v.shape[0] - 1) // v.shape[0]
+                            kwargs[k] = v.repeat(repeats, *([1] * (v.dim() - 1)))[:actual_bs]
+                        else:
+                            kwargs[k] = v
             else:
                 kwargs["prompt"] = [prompt_cycle[idx % len(prompt_cycle)] for idx in batch_indices]
                 kwargs["negative_prompt"] = self.negative_prompt
-                if pipeline_kwargs_override:
-                    kwargs.update(pipeline_kwargs_override)
+                if single_override:
+                    kwargs.update(single_override)
 
             output = pipeline(**kwargs)
             fid_images.extend(output.images)

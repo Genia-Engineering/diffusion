@@ -70,9 +70,16 @@ def enable_tf32():
 
 
 def _enable_gradient_checkpointing(model: nn.Module, name: str) -> None:
-    if hasattr(model, "enable_gradient_checkpointing"):
+    if not hasattr(model, "enable_gradient_checkpointing"):
+        return
+    if hasattr(model, "_supports_gradient_checkpointing") and not model._supports_gradient_checkpointing:
+        logger.info(f"{name} does not support gradient checkpointing, skipping")
+        return
+    try:
         model.enable_gradient_checkpointing()
         logger.info(f"Gradient checkpointing enabled for {name}")
+    except ValueError:
+        logger.info(f"{name} does not support gradient checkpointing, skipping")
 
 
 def _apply_attention_backend(model: nn.Module, name: str, backend: str) -> None:
@@ -138,3 +145,44 @@ def log_gpu_memory(prefix: str = "") -> None:
         allocated = torch.cuda.memory_allocated() / 1024**3
         reserved = torch.cuda.memory_reserved() / 1024**3
         logger.info(f"{prefix} GPU memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
+
+
+def patch_caption_projection_layernorm(transformer: nn.Module) -> bool:
+    """Inject LayerNorm into PixArt caption_projection to prevent bf16 overflow.
+
+    Original: Linear(4096→1152) → GELU → Linear(1152→1152)
+    Patched:  Linear(4096→1152) → LayerNorm(1152) → GELU → Linear(1152→1152)
+
+    Safe to call multiple times; skips if already patched.
+
+    Returns:
+        True if patched, False if skipped.
+    """
+    if not hasattr(transformer, "caption_projection"):
+        return False
+
+    cp = transformer.caption_projection
+    if not hasattr(cp, "linear_1"):
+        return False
+    if hasattr(cp, "norm"):
+        return False
+
+    hidden_size = cp.linear_1.out_features
+    cp.norm = nn.LayerNorm(hidden_size).to(
+        device=cp.linear_1.weight.device,
+        dtype=cp.linear_1.weight.dtype,
+    )
+
+    def _ln_forward(caption):
+        hidden_states = cp.linear_1(caption)
+        hidden_states = cp.norm(hidden_states)
+        hidden_states = cp.act_1(hidden_states)
+        hidden_states = cp.linear_2(hidden_states)
+        return hidden_states
+
+    cp.forward = _ln_forward
+    logger.info(
+        f"caption_projection patched: injected LayerNorm({hidden_size}) "
+        f"after linear_1 to prevent bf16 overflow"
+    )
+    return True

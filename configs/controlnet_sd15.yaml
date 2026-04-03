@@ -2,6 +2,13 @@
 # SD 1.5 ControlNet 训练配置
 # 数据集 ~4717 对（floor: 3432, top: 1285），batch_size=4
 # ControlNet 参数量大，需更长训练: ~10 epoch ≈ 10000 step
+#
+# 启动方式:
+#   bash train.sh controlnet sd15              # 标准多卡
+#   bash train.sh controlnet sd15 resume       # 恢复训练
+#
+# FID 评估:
+#   bash train.sh eval_fid --config configs/controlnet_sd15.yaml
 # ============================================================
 
 model:

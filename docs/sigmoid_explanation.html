@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sigmoid 软阈值去色原理</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;500;700&family=JetBrains+Mono:wght@400;600&display=swap');
+  :root { --bg:#0a0e17; --surface:#131926; --border:#1e293b; --text:#e2e8f0;
+    --muted:#94a3b8; --accent:#38bdf8; --pink:#f472b6; --purple:#a78bfa;
+    --green:#4ade80; --orange:#fb923c; --red:#f87171; }
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{font-family:'Noto Sans SC',sans-serif;background:var(--bg);color:var(--text);padding:28px}
+  h1{font-size:1.5rem;font-weight:700;background:linear-gradient(135deg,var(--accent),var(--purple));
+    -webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:4px}
+  .sub{color:var(--muted);font-size:.82rem;margin-bottom:20px;font-family:'JetBrains Mono',monospace}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-bottom:18px}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:16px}
+  .card h2{font-size:.92rem;font-weight:600;color:var(--accent);margin-bottom:10px}
+  .card h2.purple{color:var(--purple)}
+  canvas{width:100%;border-radius:6px}
+  .ctrls{display:flex;gap:14px;flex-wrap:wrap;margin-top:10px;align-items:center}
+  .cg{display:flex;align-items:center;gap:5px}
+  .cg label{font-size:.75rem;color:var(--muted);font-family:'JetBrains Mono',monospace}
+  .cg input[type=range]{width:110px;accent-color:var(--accent)}
+  .v{font-family:'JetBrains Mono',monospace;font-size:.75rem;color:var(--accent);min-width:30px}
+  .legend{display:flex;gap:14px;margin-top:8px;flex-wrap:wrap}
+  .li{display:flex;align-items:center;gap:4px;font-size:.72rem;color:var(--muted)}
+  .ld{width:10px;height:10px;border-radius:50%}
+  .full{grid-column:1/-1}
+  .note{font-size:.78rem;color:var(--muted);margin-top:10px;line-height:1.6}
+  .note b{color:var(--green)}
+  .note em{color:var(--pink);font-style:normal}
+  .flow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:12px}
+  .step{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px 12px;
+    font-size:.75rem;text-align:center;line-height:1.4}
+  .step b{color:var(--accent);display:block}
+  .arr{color:var(--border);font-size:1.1rem}
+</style>
+</head>
+<body>
+
+<h1>Sigmoid 软阈值 — 去除颜色干扰原理</h1>
+<p class="sub">pred_soft = σ( (max(R,G,B) − threshold) × temperature )</p>
+
+<div class="grid">
+
+  <!-- Chart 1: Sigmoid curve -->
+  <div class="card">
+    <h2>① Sigmoid 响应曲线 (交互)</h2>
+    <canvas id="c1" height="280"></canvas>
+    <div class="ctrls">
+      <div class="cg"><label>threshold:</label>
+        <input type="range" id="sT" min="0.05" max="0.5" step="0.01" value="0.1">
+        <span class="v" id="vT">0.10</span></div>
+      <div class="cg"><label>temperature:</label>
+        <input type="range" id="sP" min="2" max="50" step="1" value="20">
+        <span class="v" id="vP">20</span></div>
+    </div>
+    <div class="legend">
+      <div class="li"><div class="ld" style="background:var(--accent)"></div>sigmoid 输出</div>
+      <div class="li"><div class="ld" style="background:var(--pink)"></div>梯度 (缩放)</div>
+      <div class="li"><div class="ld" style="background:rgba(74,222,128,.3)"></div>有效梯度区</div>
+    </div>
+  </div>
+
+  <!-- Chart 2: Color table -->
+  <div class="card">
+    <h2 class="purple">② 各颜色经 sigmoid 后的输出</h2>
+    <canvas id="c2" height="280"></canvas>
+    <p class="note">
+      所有前景色 → max(R,G,B) > 0.3 → sigmoid 输出 <b>≈ 1.0</b><br>
+      黑色背景 → max(R,G,B) ≈ 0 → sigmoid 输出 <em>≈ 0.12</em><br>
+      → <b>红门=蓝窗=灰墙=橙平台 ≈ 1</b>，颜色信息被完全压缩为二值结构
+    </p>
+  </div>
+
+  <!-- Pipeline -->
+  <div class="card full">
+    <h2>③ 完整去色流程</h2>
+    <div class="flow">
+      <div class="step">VAE 解码<b>RGB 图像</b>红/蓝/绿...</div>
+      <div class="arr">→</div>
+      <div class="step">归一化<b>[0, 1]</b></div>
+      <div class="arr">→</div>
+      <div class="step" style="border-color:var(--orange)">max(R,G,B)<b>去除色相</b>只保留亮度</div>
+      <div class="arr">→</div>
+      <div class="step" style="border-color:var(--accent)">sigmoid<b>去除亮度</b>压缩为 0/1</div>
+      <div class="arr">→</div>
+      <div class="step" style="border-color:var(--green)">vs orig_binary<b>MSE loss</b>纯结构比较</div>
+    </div>
+    <p class="note" style="margin-top:14px">
+      <b>第一步去色相</b>：max(R,G,B) 让 (220,0,0)红 和 (0,200,0)绿 都变成标量 0.86 / 0.78 → 颜色信息丢失<br>
+      <b>第二步去亮度</b>：sigmoid 让 0.86 和 0.78 都映射到 ≈1.0 → 亮度差异也被消除<br>
+      最终只剩 <b>"此处有东西(≈1)"</b> vs <b>"此处空白(≈0)"</b> 的二值结构信息
+    </p>
+  </div>
+</div>
+
+<script>
+const $=id=>document.getElementById(id);
+const sig=x=>1/(1+Math.exp(-x));
+
+function draw1(){
+  const cv=$('c1'),ctx=cv.getContext('2d');
+  const W=cv.width=cv.offsetWidth*2, H=cv.height=560;
+  ctx.clearRect(0,0,W,H);
+  const th=parseFloat($('sT').value), tp=parseFloat($('sP').value);
+  $('vT').textContent=th.toFixed(2); $('vP').textContent=tp;
+
+  const p={l:55,r:15,t:18,b:45}, cw=W-p.l-p.r, ch=H-p.t-p.b;
+  const tx=v=>p.l+v*cw, ty=v=>p.t+(1-v)*ch;
+
+  // grid
+  ctx.strokeStyle='#1e293b'; ctx.lineWidth=1;
+  for(let i=0;i<=10;i++){
+    ctx.beginPath();ctx.moveTo(tx(i/10),p.t);ctx.lineTo(tx(i/10),H-p.b);ctx.stroke();
+    ctx.beginPath();ctx.moveTo(p.l,ty(i/10));ctx.lineTo(W-p.r,ty(i/10));ctx.stroke();
+  }
+  // labels
+  ctx.fillStyle='#94a3b8';ctx.font='20px JetBrains Mono';ctx.textAlign='center';
+  for(let i=0;i<=10;i+=2) ctx.fillText((i/10).toFixed(1),tx(i/10),H-p.b+22);
+  ctx.textAlign='right';
+  for(let i=0;i<=10;i+=2) ctx.fillText((i/10).toFixed(1),p.l-6,ty(i/10)+5);
+  ctx.textAlign='center';ctx.fillText('pred_max = max(R,G,B)',W/2,H-4);
+
+  // effective zone
+  const lo=Math.max(0,th-2.5/tp), hi=Math.min(1,th+2.5/tp);
+  ctx.fillStyle='rgba(74,222,128,0.08)';
+  ctx.fillRect(tx(lo),p.t,tx(hi)-tx(lo),ch);
+
+  // threshold line
+  ctx.strokeStyle='#475569';ctx.lineWidth=2;ctx.setLineDash([8,6]);
+  ctx.beginPath();ctx.moveTo(tx(th),p.t);ctx.lineTo(tx(th),H-p.b);ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle='#64748b';ctx.font='17px JetBrains Mono';ctx.textAlign='left';
+  ctx.fillText('th='+th.toFixed(2),tx(th)+4,p.t+18);
+
+  // sigmoid
+  ctx.strokeStyle='#38bdf8';ctx.lineWidth=3;ctx.beginPath();
+  for(let i=0;i<=200;i++){const x=i/200,s=sig((x-th)*tp);
+    i?ctx.lineTo(tx(x),ty(s)):ctx.moveTo(tx(x),ty(s));}ctx.stroke();
+
+  // gradient
+  const mg=tp*0.25;
+  ctx.strokeStyle='#f472b6';ctx.lineWidth=2;ctx.beginPath();
+  for(let i=0;i<=200;i++){const x=i/200,g=sig((x-th)*tp),gv=g*(1-g)*tp,gn=Math.min(gv/mg,1);
+    i?ctx.lineTo(tx(x),ty(gn)):ctx.moveTo(tx(x),ty(gn));}ctx.stroke();
+
+  // color dots
+  [{n:'纯黑',m:0,c:'#444'},{n:'暗蓝',m:.39,c:'#4466cc'},{n:'红色',m:.86,c:'#dd2222'},{n:'白色',m:1,c:'#ddd'}]
+  .forEach(e=>{
+    const s=sig((e.m-th)*tp),px=tx(e.m),py=ty(s);
+    ctx.fillStyle=e.c;ctx.beginPath();ctx.arc(px,py,7,0,7);ctx.fill();
+    ctx.strokeStyle='#fff';ctx.lineWidth=1.5;ctx.stroke();
+    ctx.fillStyle='#e2e8f0';ctx.font='16px Noto Sans SC';ctx.textAlign='center';
+    ctx.fillText(e.n,px,py-13);
+    ctx.fillStyle='#38bdf8';ctx.font='14px JetBrains Mono';
+    ctx.fillText('→'+s.toFixed(2),px,py+20);
+  });
+}
+
+function draw2(){
+  const cv=$('c2'),ctx=cv.getContext('2d');
+  const W=cv.width=cv.offsetWidth*2, H=cv.height=560;
+  ctx.clearRect(0,0,W,H);
+  const th=0.1,tp=20;
+  const colors=[
+    {n:'纯黑(BG)',rgb:[0,0,0]},{n:'深灰(BG)',rgb:[15,15,15]},
+    {n:'门(红)',rgb:[220,0,0]},{n:'窗(绿)',rgb:[0,200,0]},
+    {n:'开口(蓝)',rgb:[20,50,230]},{n:'墙(灰)',rgb:[230,230,230]},
+    {n:'甲板(橙)',rgb:[220,120,0]},{n:'柱(紫)',rgb:[180,0,200]}
+  ];
+  const cols=[{x:20,w:130,h:'颜色'},{x:160,w:120,h:'max(RGB)'},{x:290,w:100,h:'sigmoid'},{x:400,w:100,h:'结果'}];
+  const sc=(W-40)/(cols[3].x+cols[3].w);
+  ctx.save();ctx.translate(20,0);ctx.scale(sc,1);
+
+  ctx.fillStyle='#64748b';ctx.font='bold 20px Noto Sans SC';
+  cols.forEach(c=>ctx.fillText(c.h,c.x,24));
+  ctx.strokeStyle='#1e293b';ctx.beginPath();ctx.moveTo(0,32);ctx.lineTo(520,32);ctx.stroke();
+
+  colors.forEach((c,i)=>{
+    const y=42+i*62, mx=Math.max(...c.rgb)/255, sv=sig((mx-th)*tp);
+    // swatch
+    ctx.fillStyle=`rgb(${c.rgb})`;ctx.fillRect(cols[0].x,y+4,28,28);
+    ctx.strokeStyle='#475569';ctx.strokeRect(cols[0].x,y+4,28,28);
+    ctx.fillStyle='#e2e8f0';ctx.font='17px Noto Sans SC';ctx.fillText(c.n,cols[0].x+34,y+24);
+    // max
+    ctx.fillStyle='#fb923c';ctx.font='17px JetBrains Mono';ctx.fillText(mx.toFixed(3),cols[1].x,y+24);
+    // sigmoid
+    ctx.fillStyle=sv>.5?'#4ade80':'#f87171';ctx.font='bold 18px JetBrains Mono';
+    ctx.fillText(sv.toFixed(3),cols[2].x,y+24);
+    // bar
+    const bx=cols[3].x,bw=80;
+    ctx.fillStyle='#1e293b';ctx.fillRect(bx,y+6,bw,24);
+    ctx.fillStyle=sv>.5?'#4ade80':'#f87171';ctx.globalAlpha=.7;
+    ctx.fillRect(bx,y+6,bw*sv,24);ctx.globalAlpha=1;
+    ctx.fillStyle='#fff';ctx.font='14px JetBrains Mono';ctx.textAlign='center';
+    ctx.fillText(sv>.5?'≈1 前景':'≈0 背景',bx+bw/2,y+23);ctx.textAlign='left';
+  });
+  ctx.restore();
+}
+
+$('sT').oninput=$('sP').oninput=draw1;
+draw1();draw2();
+window.onresize=()=>{draw1();draw2()};
+</script>
+</body>
+</html>

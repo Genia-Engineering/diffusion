@@ -1,0 +1,93 @@
+# ============================================================
+# PixArt-Sigma Native Img2Img — Stage 2 结构精修 (Refine)
+# 从 Stage 1 checkpoint 恢复, 仅训练低噪声步 + 非线性结构 BCE loss
+#
+# 工作流:
+#   1. 先用 pixart_sigma_native_img2img.yaml 完成 Stage 1 全时间步训练
+#   2. 用本配置从 Stage 1 checkpoint resume:
+#        bash train.sh pixart_native_img2img_refine resume
+#
+# 与 Stage 1 的关键差异:
+#   - output_dir 指向 Stage 1 的输出目录 (resume 需要)
+#   - learning_rate 降低 5 倍 (2e-5), 防止遗忘高噪声步行为
+#   - num_train_steps 较少 (500 步即可)
+#   - refine_enabled: true → 启用时间步限制 + 结构 BCE loss
+#
+# 硬件: 同 Stage 1 (4× NVIDIA A10G)
+#
+# 启动方式:
+#   bash train.sh pixart_native_img2img_refine resume   # 从 Stage 1 恢复
+#
+# FID 评估:
+#   bash train.sh eval_fid --config configs/pixart_sigma_native_img2img_refine.yaml
+# ============================================================
+
+model:
+  pretrained_model_name_or_path: "PixArt-alpha/PixArt-Sigma-XL-2-1024-MS"
+  model_type: "pixart_sigma"
+  weights_dir: "/home/daiqing_tan/stable_diffusion_lora/weights"
+  injection_interval: 4
+  finetuned_transformer_path: "./outputs/pixart_sigma_floorplan/checkpoints/step_002000/transformer"
+
+training:
+  # 与 Stage 1 相同的 output_dir, resume 时从此目录读取 checkpoint
+  output_dir: "./outputs/pixart_native_img2img"
+  num_train_steps: 500
+  learning_rate: 2.0e-5              # Stage 1 的 1/5, 防止遗忘
+  train_batch_size: 8
+  gradient_accumulation_steps: 2
+  mixed_precision: "bf16"
+
+  cache_latents: true
+  latent_cache_batch_size: 8
+
+  phase3_mode: "new_modules_only"
+  cond_dropout_prob: 0.1
+
+  validation_steps: 100
+  save_steps: 100
+  keep_last_n_checkpoints: 5
+  lr_warmup_steps: 50
+  lr_scheduler: "cosine"
+  max_grad_norm: 1.0
+  gradient_checkpointing: true
+  compile_model: false
+  loss_type: "mse"
+
+  # ── 噪声范式 (与 Stage 1 一致) ──
+  noise_paradigm: "ddpm"
+  prediction_type: "epsilon"
+  noise_offset: 0.05
+  min_snr_gamma: 5.0
+
+  # ── 损失权重矩阵 (与 Stage 1 一致) ──
+  loss_weight_enabled: true
+  loss_weight_threshold: 0.1
+  loss_weight_fg_structure: 5.0
+  loss_weight_bg_structure: 5.0
+  loss_weight_fg_color: 2.0
+  loss_weight_bg_color: 1.0
+
+  # ── Refine 模式 (本配置核心) ──
+  refine_enabled: true
+  refine_max_timestep: 400           # 训练 t∈[0, 400), 比实际需要多 ~100 步余量
+  refine_struct_lambda: 0.5          # 结构 BCE loss 权重 (主 loss 仍为 ε MSE)
+  refine_struct_sharpness: 20.0      # sigmoid 锐度 (10~30)
+
+  use_ema: true
+  ema_decay: 0.9999
+  ema_update_after_step: 0           # refine 从第 0 步就更新 EMA
+
+  seed: 42
+
+data:
+  train_data_dir: "/home/daiqing_tan/stable_diffusion_lora/data/data/size_1024/floor"
+  conditioning_data_dir: "/home/daiqing_tan/stable_diffusion_lora/data/data/size_1024_controlnet/floor"
+  resolution: 1024
+  random_flip: true
+
+validation:
+  num_val_images: 4
+  num_inference_steps: 50
+  guidance_scale: 4.5
+  seed: 42

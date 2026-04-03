@@ -34,7 +34,7 @@ from tqdm import tqdm
 
 from data.buckets import BucketManager
 from data.dataset import BaseImageDataset
-from data.transforms import AspectRatioResize
+from data.transforms import AspectRatioPad, AspectRatioResize
 from models.model_loader import load_sd15_components, load_sdxl_components
 
 logging.basicConfig(
@@ -75,6 +75,8 @@ def main():
     data_cfg = config.data
     resolution = data_cfg.get("resolution", 512 if model_type == "sd15" else 1024)
     center_crop = data_cfg.get("center_crop", False)
+    use_bucketing = data_cfg.get("use_aspect_ratio_bucketing", True)
+    pad_color = tuple(data_cfg.get("pad_color", [0, 0, 0]))
 
     # ── 初始化 Accelerator（纯推理，无需优化器/调度器） ──────────
     accelerator = Accelerator(mixed_precision="bf16")
@@ -96,7 +98,7 @@ def main():
         random_flip=False,
     )
 
-    if data_cfg.get("use_aspect_ratio_bucketing", True):
+    if use_bucketing:
         bucket_manager = BucketManager(model_type=model_type)
         image_sizes = dataset.get_image_sizes()
         bucket_to_indices = bucket_manager.assign_buckets(image_sizes)
@@ -118,7 +120,9 @@ def main():
     if explicit_cache_dir:
         cache_dir = Path(explicit_cache_dir)
     else:
-        cache_dir = Path(data_cfg.train_data_dir) / "latent_cache"
+        parent = Path(data_cfg.train_data_dir).parent
+        suffix = "" if use_bucketing else "_pad"
+        cache_dir = parent / f"latent_cache_{model_type}{suffix}"
     done_marker = cache_dir / ".precompute_done"
 
     if done_marker.exists():
@@ -179,8 +183,14 @@ def main():
             target_size = dataset._get_target_size(idx)   # (w, h)
             target_w, target_h = target_size
 
-            resizer = AspectRatioResize(target_size, center_crop=center_crop)
-            image_resized = resizer(image)
+            pad_mask_tensor = None
+            if use_bucketing:
+                resizer = AspectRatioResize(target_size, center_crop=center_crop)
+                image_resized = resizer(image)
+            else:
+                padder = AspectRatioPad(target_size, pad_color=pad_color)
+                image_resized, pad_mask_pil = padder(image)
+                pad_mask_tensor = to_tensor(pad_mask_pil)  # (1, H, W)
 
             img_t = normalize(to_tensor(image_resized)).unsqueeze(0).to(device)
             with torch.no_grad():
@@ -194,16 +204,24 @@ def main():
                 latent_flip = latent_flip * vae.config.scaling_factor
             latent_flip = latent_flip.squeeze(0).to(dtype=torch.float16).cpu()
 
-            torch.save(
-                {
-                    "latent": latent,
-                    "latent_flip": latent_flip,
-                    "original_hw": torch.tensor([orig_h, orig_w], dtype=torch.long),
-                    "target_hw": torch.tensor([target_h, target_w], dtype=torch.long),
-                    "source_filename": dataset.image_paths[idx].name,
-                },
-                out_path,
-            )
+            save_dict = {
+                "latent": latent,
+                "latent_flip": latent_flip,
+                "original_hw": torch.tensor([orig_h, orig_w], dtype=torch.long),
+                "target_hw": torch.tensor([target_h, target_w], dtype=torch.long),
+                "source_filename": dataset.image_paths[idx].name,
+            }
+            if pad_mask_tensor is not None:
+                latent_h, latent_w = latent.shape[-2], latent.shape[-1]
+                pm = torch.nn.functional.interpolate(
+                    pad_mask_tensor.unsqueeze(0),
+                    size=(latent_h, latent_w),
+                    mode="bilinear",
+                    align_corners=False,
+                ).squeeze(0).to(torch.float16)
+                save_dict["padding_mask"] = pm
+
+            torch.save(save_dict, out_path)
 
     # ── 等待所有卡完成，由 rank 0 写完成标记 ─────────────────────
     # 使用文件轮询代替 NCCL barrier，避免 600s 超时

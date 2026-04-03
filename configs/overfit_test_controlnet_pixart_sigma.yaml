@@ -11,6 +11,12 @@
 # 预计耗时（4× A10G）：
 #   800 步 × ~3s/step ≈ ~40 min
 #   触发 8 次验证（每 100 步）
+#
+# 启动方式:
+#   bash train.sh overfitpixart_cn
+#
+# FID 评估:
+#   bash train.sh eval_fid --config configs/overfit_test_controlnet_pixart_sigma.yaml
 # ============================================================
 
 model:

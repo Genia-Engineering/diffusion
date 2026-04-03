@@ -1,0 +1,99 @@
+# ============================================================
+# PixArt-Sigma IP-Adapter 训练配置
+#
+# 训练范式: Rectified Flow (Flow Matching) + IP-Adapter
+#   - T5-XXL 文本编码器保留，提供文本条件
+#   - CLIP ViT-H 图像编码器提供图像条件 (decoupled cross-attention)
+#   - 两个条件独立 dropout，支持 text-only / image-only / text+image 推理
+#   - 可选 LoRA: Transformer 注入 LoRA，与 IP-Adapter 联合训练，各用独立学习率
+#
+# 硬件: 4× NVIDIA A10G (23GB each)
+#
+# 显存估算 (per GPU, bf16, gc=ON, lora enabled):
+#   Transformer (frozen base + LoRA, bf16): ~1.2GB + LoRA ~0.03GB + 优化器 ~0.1GB
+#   IP-Adapter (ImageProjection + attn processors): ~85M params → ~0.17GB + 优化器 ~0.7GB
+#   VAE decoder: ~0.08GB
+#   激活值 (gradient checkpointing + LoRA backward): ~8-12GB
+#   T5/CLIP/VAE encoder: 预缓存后全部卸载
+#   合计: ~12-15GB/卡 (需降低 batch_size，用 grad_accum 补回)
+#
+# 启动方式:
+#   bash train.sh pixart_ipa                    # 标准多卡（冻结 Transformer）
+#   bash train.sh pixart_ipa resume             # 恢复训练
+#
+# FID 评估:
+#   bash train.sh eval_fid --config configs/pixart_sigma_ip_adapter.yaml
+# ============================================================
+
+model:
+  pretrained_model_name_or_path: "PixArt-alpha/PixArt-Sigma-XL-2-1024-MS"
+  model_type: "pixart_sigma"
+  weights_dir: "/home/daiqing_tan/stable_diffusion_lora/weights"
+
+  ip_adapter:
+    clip_model: "laion/CLIP-ViT-H-14-laion2B-s32B-b79K"
+    num_tokens: 16             # Resampler 输出 token 数 (16/64/256)
+    resampler_depth: 4         # Perceiver Resampler 层数
+    ip_scale: 1.0              # IP cross-attention 缩放系数
+
+lora:
+  enabled: true                        # true = 注入 LoRA 到 Transformer; false = 不注入
+  rank: 32
+  alpha: 32.0
+  target_modules:
+    - "to_q"
+    - "to_k"
+    - "to_v"
+    - "to_out.0"
+    - "ff.net.0.proj"
+    - "ff.net.2"
+
+training:
+  output_dir: "./outputs/pixart_ip_adapter"
+  num_train_steps: 1000
+  learning_rate: 1.0e-5             # Transformer LoRA 学习率 (lora.enabled=true 时生效)
+  ip_adapter_lr: 1.0e-4             # IP-Adapter 参数学习率
+  train_batch_size: 8
+  gradient_accumulation_steps: 1
+  mixed_precision: "bf16"
+
+  freeze_transformer: true           # LoRA 模式下自动冻结 base weights，此项被忽略
+
+  cache_latents: true
+  cache_text_embeddings: true
+  cache_clip_features: true
+  latent_cache_batch_size: 4
+
+  cond_dropout_prob: 0.05            # 图像条件 dropout (训练无图像条件分支)
+  text_dropout_prob: 0.0            # 文本条件 dropout (训练无文本条件分支)
+
+  validation_steps: 100
+  save_steps: 100
+  keep_last_n_checkpoints: 5
+  lr_warmup_steps: 50
+  gradient_checkpointing: true
+  compile_model: false
+  loss_type: "mse"
+  max_grad_norm: 1.0
+
+  use_ema: false
+  ema_decay: 0.9999
+
+  timestep_sampling: "logit_normal"
+  logit_mean: 0.0
+  logit_std: 1.0
+  scheduler_shift: 1.0
+
+data:
+  train_data_dir: "/home/daiqing_tan/stable_diffusion_lora/data/data/size_1024/floor"
+  conditioning_data_dir: "/home/daiqing_tan/stable_diffusion_lora/data/data/size_1024_controlnet/floor"
+  resolution: 1024
+  caption: "architectural floor plan, blueprint, technical drawing"
+
+validation:
+  num_val_images: 4
+  num_inference_steps: 50
+  guidance_scale: 4.5
+  seed: 42
+
+  compute_fid: false

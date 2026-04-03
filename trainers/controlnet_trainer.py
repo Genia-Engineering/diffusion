@@ -15,6 +15,7 @@ ControlNet 灵活冻结（可组合，互不冲突）:
   freeze_mid_block:       冻结瓶颈层
 """
 
+import gc
 import logging
 import math
 import os
@@ -36,6 +37,17 @@ from utils.validation import ValidationLoop
 from .base_trainer import BaseTrainer
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_collate(batch):
+    """PyTorch 2.10+ 兼容 collate: 避免 shared storage 不可 resize 问题。"""
+    elem = batch[0]
+    if isinstance(elem, dict):
+        return {key: _safe_collate([d[key] for d in batch]) for key in elem}
+    if isinstance(elem, torch.Tensor):
+        return torch.stack([x.clone().contiguous() for x in batch], dim=0)
+    from torch.utils.data._utils.collate import default_collate
+    return default_collate(batch)
 
 
 class ControlNetTrainer(BaseTrainer):
@@ -95,12 +107,21 @@ class ControlNetTrainer(BaseTrainer):
         else:
             weight_dtype = torch.float32
 
+        # merged_unet_path 存在时跳过默认 UNet 加载，避免同时驻留多份 UNet (~5GB each)
+        has_merged = merged_unet_path and os.path.isdir(merged_unet_path)
+
         if self.model_type == "sdxl":
-            components = load_sdxl_components(model_path, weights_dir=weights_dir, dtype=weight_dtype)
+            components = load_sdxl_components(
+                model_path, weights_dir=weights_dir, dtype=weight_dtype,
+                skip_unet=has_merged,
+            )
             self.text_encoder_2 = components["text_encoder_2"]
             self.tokenizer_2 = components["tokenizer_2"]
         else:
-            components = load_sd15_components(model_path, weights_dir=weights_dir, dtype=weight_dtype)
+            components = load_sd15_components(
+                model_path, weights_dir=weights_dir, dtype=weight_dtype,
+                skip_unet=has_merged,
+            )
             self.text_encoder_2 = None
             self.tokenizer_2 = None
 
@@ -109,7 +130,7 @@ class ControlNetTrainer(BaseTrainer):
         self.tokenizer = components["tokenizer"]
         self.noise_scheduler = components["noise_scheduler"]
 
-        if merged_unet_path and os.path.isdir(merged_unet_path):
+        if has_merged:
             logger.info(f"Loading merged UNet from {merged_unet_path}")
             self.unet = UNet2DConditionModel.from_pretrained(
                 merged_unet_path, subfolder="unet", torch_dtype=weight_dtype,
@@ -300,12 +321,14 @@ class ControlNetTrainer(BaseTrainer):
                 dataset, batch_size=batch_size, sampler=sampler,
                 num_workers=self.training_cfg.get("dataloader_num_workers", 4),
                 pin_memory=True, drop_last=True,
+                collate_fn=_safe_collate,
             )
         else:
             dataloader = DataLoader(
                 dataset, batch_size=batch_size, shuffle=True,
                 num_workers=self.training_cfg.get("dataloader_num_workers", 4),
                 pin_memory=True, drop_last=True,
+                collate_fn=_safe_collate,
             )
 
         return dataloader
@@ -368,9 +391,9 @@ class ControlNetTrainer(BaseTrainer):
         optimizer = self.setup_optimizer(trainable_params=all_trainable)
         lr_scheduler = self.setup_lr_scheduler(optimizer, num_train_steps)
 
-        self.controlnet, self.unet, optimizer, dataloader, lr_scheduler = (
+        self.controlnet, self.unet, optimizer, dataloader = (
             self.accelerator.prepare(
-                self.controlnet, self.unet, optimizer, dataloader, lr_scheduler
+                self.controlnet, self.unet, optimizer, dataloader
             )
         )
 
@@ -440,10 +463,10 @@ class ControlNetTrainer(BaseTrainer):
                         grad_norm = grad_norm.item() if hasattr(grad_norm, 'item') else float(grad_norm)
 
                     optimizer.step()
-                    lr_scheduler.step()
                     optimizer.zero_grad()
 
                 if self.accelerator.sync_gradients:
+                    lr_scheduler.step()
                     self.global_step += 1
                     current_lr = lr_scheduler.get_last_lr()[0]
                     self.log_step(loss.item(), current_lr, grad_norm)
@@ -704,7 +727,7 @@ class ControlNetTrainer(BaseTrainer):
         from data.controlnet_dataset import _KNOWN_SUFFIX_PAIRS, _strip_known_suffix
 
         val_cfg = self.config.get("validation", {})
-        n = len(list(val_cfg.get("prompts", [""])))
+        n = val_cfg.get("num_val_samples", len(list(val_cfg.get("prompts", [""]))))
         resolution = self.config.data.get("resolution", 1024)
         _IMG_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 

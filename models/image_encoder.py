@@ -1,15 +1,16 @@
 """图像条件编码器 — 将条件图像编码为 cross-attention 特征序列。
 
-支持两种编码模式：
+支持三种编码模式：
   - VAE 模式: 复用已有 VAE encoder，通过可训练 patchify 卷积投射到 caption_channels
   - DINOv2 模式: frozen DINOv2 ViT-L/14 + 可训练 MLP 投射层
+  - CLIP 模式: frozen CLIP ViT-H/14 + 可训练 MLP 投射层
 
-两种模式的 forward 统一返回 (encoder_hidden_states, encoder_attention_mask)，
+三种模式的 forward 统一返回 (encoder_hidden_states, encoder_attention_mask)，
 可直接作为 PixArtTransformer2DModel 的 cross-attention 输入。
 
 维度对齐：
   PixArt-Sigma 的 caption_channels = 4096，内部 caption_projection 将 4096 → 1152。
-  两种编码器的投射层均输出 dim = 4096，复用 Transformer 已有的 caption_projection。
+  三种编码器的投射层均输出 dim = 4096，复用 Transformer 已有的 caption_projection。
 """
 
 import logging
@@ -120,6 +121,7 @@ class DINOv2ImageEncoder(nn.Module):
             nn.GELU(),
             nn.Linear(projection_dim, projection_dim),
         )
+        self.output_norm = nn.LayerNorm(projection_dim)
         self._init_projection()
 
         self.resolution = resolution
@@ -172,6 +174,87 @@ class DINOv2ImageEncoder(nn.Module):
             encoder_attention_mask: (B, num_patches), 全 1
         """
         x = self.projection(features)
+        x = self.output_norm(x)
+        mask = torch.ones(
+            x.shape[:2], dtype=torch.long, device=x.device
+        )
+        return x, mask
+
+
+class CLIPImageEncoder(nn.Module):
+    """CLIP Vision frozen backbone + 可训练 MLP 投射层。
+
+    CLIP ViT-H/14 (laion/CLIP-ViT-H-14-laion2B-s32B-b79K):
+      - hidden_size = 1280, patch_size = 14
+      - 224px 输入 → 16x16 = 256 patch tokens (+ CLS)
+      - 使用 hidden_states[-2]（倒数第二层）作为特征，去掉 CLS token
+
+    投射层将 CLIP 特征 (B, N, 1280) 映射到 (B, N, projection_dim=4096)。
+    """
+
+    def __init__(
+        self,
+        model_name: str = "laion/CLIP-ViT-H-14-laion2B-s32B-b79K",
+        projection_dim: int = 4096,
+        freeze_backbone: bool = True,
+        resolution: int | None = 224,
+    ):
+        super().__init__()
+        from transformers import CLIPVisionModelWithProjection
+
+        self.backbone = CLIPVisionModelWithProjection.from_pretrained(model_name)
+        hidden_size = self.backbone.config.hidden_size  # 1280 for ViT-H
+        self.patch_size = self.backbone.config.patch_size  # 14
+
+        self.projection = nn.Sequential(
+            nn.Linear(hidden_size, projection_dim),
+            nn.GELU(),
+            nn.Linear(projection_dim, projection_dim),
+        )
+        self.output_norm = nn.LayerNorm(projection_dim)
+        self._init_projection()
+
+        self.resolution = resolution
+
+        if freeze_backbone:
+            self.backbone.requires_grad_(False)
+            self.backbone.eval()
+            logger.info(
+                f"CLIP backbone frozen ({model_name}, "
+                f"hidden_size={hidden_size}, patch_size={self.patch_size})"
+            )
+
+    def _init_projection(self):
+        for m in self.projection.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    @torch.no_grad()
+    def encode_images(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """仅编码 backbone 部分（frozen），返回 patch features 不含 CLS token。
+
+        使用 hidden_states[-2]（倒数第二层），与 IP-Adapter 一致。
+        用于预缓存：结果保存到磁盘后不再需要 backbone。
+        """
+        outputs = self.backbone(pixel_values, output_hidden_states=True)
+        features = outputs.hidden_states[-2][:, 1:, :]  # 去掉 CLS token
+        return features
+
+    def forward(
+        self, features: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """投射 backbone 特征 → cross-attention hidden states。
+
+        Args:
+            features: (B, num_patches, hidden_size), 预缓存的 CLIP features
+
+        Returns:
+            encoder_hidden_states: (B, num_patches, projection_dim)
+            encoder_attention_mask: (B, num_patches), 全 1
+        """
+        x = self.projection(features)
+        x = self.output_norm(x)
         mask = torch.ones(
             x.shape[:2], dtype=torch.long, device=x.device
         )
@@ -211,6 +294,19 @@ def build_image_encoder(config) -> dict:
         logger.info(
             f"Built DINOv2 image encoder: model={config.get('dinov2_model', 'facebook/dinov2-large')}, "
             f"resolution={config.get('dinov2_resolution', 518)}, projection_dim={proj_dim}"
+        )
+    elif enc_type == "clip":
+        clip_model = config.get("clip_model", "laion/CLIP-ViT-H-14-laion2B-s32B-b79K")
+        clip_res = config.get("clip_resolution", 224)
+        encoder = CLIPImageEncoder(
+            model_name=clip_model,
+            projection_dim=proj_dim,
+            freeze_backbone=True,
+            resolution=clip_res,
+        )
+        logger.info(
+            f"Built CLIP image encoder: model={clip_model}, "
+            f"resolution={clip_res}, projection_dim={proj_dim}"
         )
     else:
         raise ValueError(f"Unknown image encoder type: {enc_type}")

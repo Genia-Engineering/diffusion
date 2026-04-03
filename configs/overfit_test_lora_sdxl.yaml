@@ -22,6 +22,12 @@
 # 预计耗时（4× A10G）：
 #   500 步 × ~2s/step ≈ ~17 min
 #   触发 5 次验证（每 100 步），可观察收敛曲线
+#
+# 启动方式:
+#   bash train.sh overfitlora
+#
+# FID 评估:
+#   bash train.sh eval_fid --config configs/overfit_test_lora_sdxl.yaml
 # ============================================================
 
 model:

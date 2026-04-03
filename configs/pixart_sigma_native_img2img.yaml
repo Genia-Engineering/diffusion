@@ -1,0 +1,114 @@
+# ============================================================
+# PixArt-Sigma Native Img2Img 训练配置
+# 架构: 8-channel concatenation (noisy latent + reference latent)
+#        + 每 4 层残差注入参考特征
+# 训练范式: DDPM (epsilon prediction) — 与全参微调权重对齐
+# 条件来源: 色块图 → VAE latent → 通道拼接 + 残差注入
+# T5 文本编码器: 已彻底弃用
+#
+# 硬件: 4× NVIDIA A10G (23GB each)
+# 显存估算 (per GPU, bf16, gc=ON):
+#   cache_latents → VAE 不占训练显存
+#   Transformer(bf16, frozen) ~1.2GB
+#   新增模块 (ref_proj + 7 injection gates) ~80MB
+#   激活值(梯度检查点, batch=8, seq=4096) ~9.6GB → 合计 ~11GB
+#   effective batch = 8 × 4 GPU × 4 grad_accum = 128
+#
+# 启动方式:
+#   bash train.sh pixart_native_img2img          # 标准多卡
+#   bash train.sh pixart_native_img2img resume   # 恢复训练
+#
+# FID 评估:
+#   bash train.sh eval_fid --config configs/pixart_sigma_native_img2img.yaml
+# ============================================================
+
+model:
+  # 原始模型路径 (用于加载 VAE 和 scheduler 配置)
+  pretrained_model_name_or_path: "PixArt-alpha/PixArt-Sigma-XL-2-1024-MS"
+  model_type: "pixart_sigma"
+  weights_dir: "/home/daiqing_tan/stable_diffusion_lora/weights"
+  injection_interval: 4
+
+  # 全参微调后的 Transformer 权重路径 (覆盖 pretrained 中的 Transformer)
+  # 设为 null 或删除此行则使用 pretrained_model_name_or_path 中的原始权重
+  finetuned_transformer_path: "./outputs/pixart_sigma_floorplan/checkpoints/step_002000/transformer"
+
+training:
+  output_dir: "./outputs/pixart_native_img2img"
+  num_train_steps: 3000
+  learning_rate: 1.0e-4
+  train_batch_size: 2
+  gradient_accumulation_steps: 2
+  mixed_precision: "bf16"
+
+  cache_latents: true
+  latent_cache_batch_size: 4
+
+  # "new_modules_only": 冻结 Transformer, 仅训练新增模块 (PatchEmbed + ref_proj + injection_gates)
+  # "full_finetune": 全量微调
+  phase3_mode: "new_modules_only"
+  cond_dropout_prob: 0.1
+
+  validation_steps: 300
+  save_steps: 300
+  keep_last_n_checkpoints: 10
+  lr_warmup_steps: 100
+  lr_scheduler: "cosine"
+  max_grad_norm: 1.0
+  gradient_checkpointing: true
+  compile_model: false
+  loss_type: "mse"
+
+  # ── 噪声范式 ──
+  # "flow_matching": Rectified Flow velocity prediction
+  # "ddpm": 传统 DDPM epsilon/v-prediction (与全参微调阶段对齐)
+  noise_paradigm: "ddpm"
+
+  # Flow Matching 参数 (仅 noise_paradigm=flow_matching 时生效)
+  timestep_sampling: "logit_normal"
+  logit_mean: 0.0
+  logit_std: 1.0
+  scheduler_shift: 1.0
+
+  # DDPM 参数 (仅 noise_paradigm=ddpm 时生效)
+  prediction_type: "epsilon"
+  noise_offset: 0.05
+  min_snr_gamma: 5.0
+
+  # ── 损失权重矩阵 (前景/背景 × 结构/色彩) ──
+  # 核心原则: 结构误差(前景↔背景混淆) >> 色彩误差(颜色偏差)
+  #   fg = 前景(线条), bg = 背景(空白)
+  #   structure = latent ch0(亮度/结构), color = latent ch1-3(色彩)
+  # 全部设为 1.0 或 loss_weight_enabled: false 可关闭加权
+  loss_weight_enabled: false
+  loss_weight_threshold: 0.1           # 亮度二值化阈值 (0~1)；高于此值为前景
+  loss_weight_fg_structure: 5.0       # 前景 ch0 — 线条结构(最高优先)
+  loss_weight_bg_structure: 5.0        # 背景 ch0 — 防止幻觉线条
+  loss_weight_fg_color: 2.0            # 前景 ch1-3 — 线条颜色
+  loss_weight_bg_color: 1.0            # 背景 ch1-3 — 背景颜色(最低优先)
+
+  use_ema: true
+  ema_decay: 0.9999
+  ema_update_after_step: 100
+
+  seed: 42
+
+data:
+  train_data_dir: "/home/daiqing_tan/stable_diffusion_lora/data/data/size_1024/floor"
+  conditioning_data_dir: "/home/daiqing_tan/stable_diffusion_lora/data/data/size_1024_controlnet/floor"
+  resolution: 1024
+  random_flip: true
+
+validation:
+  num_val_images: 4
+  num_inference_steps: 50
+  guidance_scale: 4.5
+  seed: 42
+
+  # compute_fid: true
+  # fid:
+  #   num_real_images: 512
+  #   num_gen_images: 512
+  #   model_name: "dinov2_vitb14"
+  #   batch_size: 8
+  #   real_features_cache: "./outputs/pixart_native_img2img/fid_real_features.npz"

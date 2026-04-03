@@ -6,12 +6,18 @@ ControlNet-XS 核心特点:
   3. adapter 与 UNet 融合为 UNetControlNetXSModel 进行联合前向传播
 
 本模块封装初始化逻辑，从已有 UNet 构建 ControlNet-XS。
+
+可选 strip_ctrl_cross_attention():
+  移除 ctrl 分支的 cross-attention，使其仅依赖图像信息。
+  文本语义通过 base→ctrl 零卷积投射间接传递（与 PixArt-Sigma XS 设计一致）。
 """
 
+import gc
 import logging
 from typing import Optional
 
 import torch
+import torch.nn as nn
 from diffusers import UNet2DConditionModel
 from diffusers.models.controlnets.controlnet_xs import (
     ControlNetXSAdapter,
@@ -19,6 +25,67 @@ from diffusers.models.controlnets.controlnet_xs import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# 辅助类 & 函数 — 移除 ctrl 分支 cross-attention
+# ---------------------------------------------------------------------------
+
+class _ResnetOnlyMidBlock(nn.Module):
+    """UNetMidBlock2DCrossAttn 的精简版 — 只保留 ResNet blocks，去掉 attention。
+
+    替换 ctrl_midblock 后，ctrl 分支在 mid stage 只做卷积特征变换，
+    不再直接处理文本嵌入。
+    """
+
+    def __init__(self, midblock: nn.Module):
+        super().__init__()
+        self.resnets = midblock.resnets
+
+    def forward(self, hidden_states, temb=None, **kwargs):
+        for resnet in self.resnets:
+            hidden_states = resnet(hidden_states, temb)
+        return hidden_states
+
+
+def strip_ctrl_cross_attention(unet_xs: UNetControlNetXSModel) -> int:
+    """移除 UNetControlNetXSModel 中 ctrl 分支的所有 cross-attention。
+
+    修改范围:
+      - Down blocks: ctrl_attentions (ModuleList) → [None, ...]，参数释放
+      - Mid block:   ctrl_midblock (UNetMidBlock2DCrossAttn) → _ResnetOnlyMidBlock
+
+    修改后 ctrl 分支仅保留:
+      - ResNet blocks (卷积 + GroupNorm + 时间步调制)
+      - base_to_ctrl / ctrl_to_base 零卷积投射
+      - Downsamplers
+
+    Returns:
+        被移除的参数总量。
+    """
+    removed = 0
+
+    # --- Down blocks ---
+    for block in unet_xs.down_blocks:
+        ctrl_attns = getattr(block, "ctrl_attentions", None)
+        if isinstance(ctrl_attns, nn.ModuleList):
+            removed += sum(p.numel() for p in ctrl_attns.parameters())
+            n = len(ctrl_attns)
+            del block.ctrl_attentions
+            block.ctrl_attentions = [None] * n
+
+    # --- Mid block ---
+    mid = unet_xs.mid_block
+    if hasattr(mid, "ctrl_midblock"):
+        old_mid = mid.ctrl_midblock
+        if hasattr(old_mid, "attentions"):
+            removed += sum(
+                p.numel() for attn in old_mid.attentions for p in attn.parameters()
+            )
+        mid.ctrl_midblock = _ResnetOnlyMidBlock(old_mid)
+
+    gc.collect()
+    return removed
 
 
 def create_controlnet_xs_sdxl(
@@ -50,8 +117,7 @@ def create_controlnet_xs_sdxl(
         should_cleanup = True
 
     adapter_kwargs = {"conditioning_channels": conditioning_channels}
-    if size_ratio is not None:
-        adapter_kwargs["size_ratio"] = size_ratio
+    adapter_kwargs["size_ratio"] = size_ratio if size_ratio is not None else 0.1
 
     adapter = ControlNetXSAdapter.from_unet(unet, **adapter_kwargs)
     unet_xs = UNetControlNetXSModel.from_unet(unet, controlnet=adapter)
@@ -85,8 +151,7 @@ def create_controlnet_xs_sd15(
         should_cleanup = True
 
     adapter_kwargs = {"conditioning_channels": conditioning_channels}
-    if size_ratio is not None:
-        adapter_kwargs["size_ratio"] = size_ratio
+    adapter_kwargs["size_ratio"] = size_ratio if size_ratio is not None else 0.1
 
     adapter = ControlNetXSAdapter.from_unet(unet, **adapter_kwargs)
     unet_xs = UNetControlNetXSModel.from_unet(unet, controlnet=adapter)

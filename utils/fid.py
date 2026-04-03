@@ -114,7 +114,7 @@ class FIDCalculator:
                     "请确认网络可访问 GitHub/PyTorch Hub，或已设置本地缓存。\n"
                     f"原始错误: {e}"
                 ) from e
-            model.eval().to(self.device)
+            model.eval().to(device=self.device, dtype=torch.bfloat16)
             self._model = model
             logger.info(f"DINOv2 ({self.model_name}) 加载完成，运行于 {self.device}")
         return self._model
@@ -126,8 +126,8 @@ class FIDCalculator:
         all_features = []
         for start in range(0, len(images), batch_size):
             batch = images[start: start + batch_size]
-            tensor = _pil_to_float_tensor(batch).to(self.device)
-            features = model(tensor)                  # (B, D)，DINOv2 默认返回 CLS token
+            tensor = _pil_to_float_tensor(batch).to(device=self.device, dtype=torch.bfloat16)
+            features = model(tensor)
             all_features.append(features.cpu().float().numpy())
         return np.concatenate(all_features, axis=0)  # (N, D)
 

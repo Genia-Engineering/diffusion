@@ -139,20 +139,16 @@ def load_sd15_components(
     weights_dir: str = None,
     dtype: torch.dtype = torch.float32,
     unet_quantization_config=None,
+    skip_unet: bool = False,
 ) -> dict:
     """加载 SD 1.5 训练所需全部组件。
 
     Args:
         unet_quantization_config: 可选 BitsAndBytesConfig，用于 QLoRA 4-bit 量化加载 UNet。
+        skip_unet: True 时跳过 UNet 加载（调用方将自行加载，如 merged_unet_path 场景）。
 
     Returns:
-        {
-            "vae": AutoencoderKL,
-            "unet": UNet2DConditionModel,
-            "text_encoder": CLIPTextModel,
-            "tokenizer": AutoTokenizer,
-            "noise_scheduler": DDPMScheduler,
-        }
+        dict，其中 "unet" 在 skip_unet=True 时为 None。
     """
     path = resolve_model_path(pretrained_model_name_or_path, weights_dir, model_type="sd15")
 
@@ -160,13 +156,15 @@ def load_sd15_components(
     text_encoder = CLIPTextModel.from_pretrained(path, subfolder="text_encoder", torch_dtype=dtype)
     vae = AutoencoderKL.from_pretrained(path, subfolder="vae", torch_dtype=dtype)
 
-    if unet_quantization_config is not None:
-        unet = UNet2DConditionModel.from_pretrained(
-            path, subfolder="unet", quantization_config=unet_quantization_config,
-        )
-        logger.info("UNet loaded with quantization (QLoRA mode)")
-    else:
-        unet = UNet2DConditionModel.from_pretrained(path, subfolder="unet", torch_dtype=dtype)
+    unet = None
+    if not skip_unet:
+        if unet_quantization_config is not None:
+            unet = UNet2DConditionModel.from_pretrained(
+                path, subfolder="unet", quantization_config=unet_quantization_config,
+            )
+            logger.info("UNet loaded with quantization (QLoRA mode)")
+        else:
+            unet = UNet2DConditionModel.from_pretrained(path, subfolder="unet", torch_dtype=dtype)
 
     noise_scheduler = DDPMScheduler.from_pretrained(path, subfolder="scheduler")
 
@@ -184,22 +182,16 @@ def load_sdxl_components(
     weights_dir: str = None,
     dtype: torch.dtype = torch.float32,
     unet_quantization_config=None,
+    skip_unet: bool = False,
 ) -> dict:
     """加载 SDXL 训练所需全部组件（含双文本编码器）。
 
     Args:
         unet_quantization_config: 可选 BitsAndBytesConfig，用于 QLoRA 4-bit 量化加载 UNet。
+        skip_unet: True 时跳过 UNet 加载（调用方将自行加载，如 merged_unet_path 场景）。
 
     Returns:
-        {
-            "vae": AutoencoderKL,
-            "unet": UNet2DConditionModel,
-            "text_encoder": CLIPTextModel,
-            "text_encoder_2": CLIPTextModelWithProjection,
-            "tokenizer": AutoTokenizer,
-            "tokenizer_2": AutoTokenizer,
-            "noise_scheduler": DDPMScheduler,
-        }
+        dict，其中 "unet" 在 skip_unet=True 时为 None。
     """
     path = resolve_model_path(pretrained_model_name_or_path, weights_dir, model_type="sdxl")
 
@@ -209,13 +201,15 @@ def load_sdxl_components(
     text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(path, subfolder="text_encoder_2", torch_dtype=dtype)
     vae  = AutoencoderKL.from_pretrained(path, subfolder="vae",  torch_dtype=dtype)
 
-    if unet_quantization_config is not None:
-        unet = UNet2DConditionModel.from_pretrained(
-            path, subfolder="unet", quantization_config=unet_quantization_config,
-        )
-        logger.info("UNet loaded with quantization (QLoRA mode)")
-    else:
-        unet = UNet2DConditionModel.from_pretrained(path, subfolder="unet", torch_dtype=dtype)
+    unet = None
+    if not skip_unet:
+        if unet_quantization_config is not None:
+            unet = UNet2DConditionModel.from_pretrained(
+                path, subfolder="unet", quantization_config=unet_quantization_config,
+            )
+            logger.info("UNet loaded with quantization (QLoRA mode)")
+        else:
+            unet = UNet2DConditionModel.from_pretrained(path, subfolder="unet", torch_dtype=dtype)
 
     noise_scheduler = DDPMScheduler.from_pretrained(path, subfolder="scheduler")
 
@@ -313,4 +307,56 @@ def load_pixart_sigma_components(
         "text_encoder": text_encoder,
         "tokenizer": tokenizer,
         "noise_scheduler": noise_scheduler,
+    }
+
+
+def load_clip_vision_model(
+    model_name_or_path: str = "laion/CLIP-ViT-H-14-laion2B-s32B-b79K",
+    weights_dir: str = None,
+    dtype: torch.dtype = torch.float32,
+) -> dict:
+    """加载 CLIP Vision 模型（用于 IP-Adapter 图像编码）。
+
+    支持 OpenCLIP 和 HuggingFace CLIP 模型。返回 frozen 模型和预处理器。
+
+    Args:
+        model_name_or_path: HuggingFace model ID 或本地路径。
+        weights_dir: 本地权重根目录，非 None 时检查本地缓存。
+        dtype: 模型权重数据类型。
+
+    Returns:
+        {
+            "model": CLIPVisionModelWithProjection (frozen),
+            "processor": CLIPImageProcessor,
+            "embed_dim": int (hidden_size of vision model),
+        }
+    """
+    from transformers import CLIPVisionModelWithProjection, CLIPImageProcessor
+
+    path = model_name_or_path
+    if weights_dir is not None and not os.path.isabs(model_name_or_path):
+        model_slug = model_name_or_path.replace("/", "--")
+        local_path = os.path.join(weights_dir, model_slug)
+        if os.path.isdir(local_path):
+            logger.info(f"从本地加载 CLIP Vision: {local_path}")
+            path = local_path
+        else:
+            logger.info(f"本地 CLIP 不存在，从 HuggingFace 下载: {model_name_or_path}")
+
+    model = CLIPVisionModelWithProjection.from_pretrained(path, torch_dtype=dtype)
+    processor = CLIPImageProcessor.from_pretrained(path)
+
+    model.requires_grad_(False)
+    model.eval()
+
+    embed_dim = model.config.hidden_size
+    logger.info(
+        f"CLIP Vision loaded: {model_name_or_path}, "
+        f"hidden_size={embed_dim}, frozen"
+    )
+
+    return {
+        "model": model,
+        "processor": processor,
+        "embed_dim": embed_dim,
     }

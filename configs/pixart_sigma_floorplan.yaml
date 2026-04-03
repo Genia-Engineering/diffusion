@@ -20,6 +20,9 @@
 # 启动方式:
 #   bash train.sh pixart             # 标准多卡（推荐）
 #   bash train.sh pixart resume      # 恢复训练
+#
+# FID 评估:
+#   bash train.sh eval_fid --config configs/pixart_sigma_floorplan.yaml -- --steps 800 1600 2400
 # ============================================================
 
 model:
@@ -29,24 +32,27 @@ model:
 
 training:
   output_dir: "./outputs/pixart_sigma_floorplan"
-  num_train_steps: 1800              # 60 epoch (3400 images, effective_batch=128, 27 step/epoch)
-  learning_rate: 2.0e-5              # 全参数微调需要较低学习率
-  train_batch_size: 8                # 每 GPU 8 个样本（gc=ON 时实测 ~12-14GB，安全）
-  gradient_accumulation_steps: 4     # 累积 4 步 → effective batch = 8×4GPU×4accum = 128
+  num_train_steps: 2400              # ~60 epoch (3432 images, effective_batch=64, 54 step/epoch)
+  learning_rate: 5.0e-5              # 全参 DDPM + 加权 Loss: 比 FM 的 2e-5 减半，避免加权梯度过大导致震荡
+  train_batch_size: 32                # 每 GPU 8 个样本（gc=ON 时实测 ~12-14GB，安全）
+  gradient_accumulation_steps: 2     # effective batch = 8×4GPU×2accum = 64
   mixed_precision: "bf16"
   cache_latents: true
   cache_text_embeddings: true
-  latent_cache_batch_size: 8         # VAE 预计算 batch size（4 卡并行，每卡 8 张 1024 分辨率）
+  latent_cache_batch_size: 4         # VAE 预计算 batch size（4 卡并行，每卡 8 张 1024 分辨率）
 
-  validation_steps: 300              # 每 270 步验证一次（约每 10 epoch）
-  save_steps: 300                    # 每 10 epoch 保存一次，共 6 个 checkpoint
-  keep_last_n_checkpoints: 6
-  lr_warmup_steps: 180               # 前 6 epoch warmup (~10% 总步数)
+  validation_steps: 200              # 每 540 步验证一次（约每 10 epoch）
+  save_steps: 200                    # 每 10 epoch 保存一次
+  keep_last_n_checkpoints: 8
+  lr_warmup_steps: 100               # 前 ~6 epoch warmup (~10% 总步数)
   gradient_checkpointing: true       # 开启后激活值显存大幅下降（batch=8 约 12-14GB）
   compile_model: false               # autotune 第一步峰值显存冲至 ~22GB 导致 OOM，保持关闭
   loss_type: "mse"
 
-  # Flow Matching 参数
+  # 噪声范式: "flow_matching" (Rectified Flow velocity) 或 "ddpm" (epsilon/v-prediction)
+  noise_paradigm: "ddpm"
+
+  # Flow Matching 参数 (仅 noise_paradigm=flow_matching 时生效)
   # DDPM→FM 迁移微调建议先用 uniform 确保全时间步覆盖；
   # 模型适应 FM 后可切换 logit_normal 聚焦中间时间步提升质量
   timestep_sampling: "uniform"       # "uniform" 或 "logit_normal"
@@ -54,25 +60,76 @@ training:
   logit_std: 1.0                     # logit-normal 分布标准差（仅 logit_normal 时生效）
   scheduler_shift: 1.0               # FlowMatchEulerDiscreteScheduler sigma shift
 
+  # DDPM 参数 (仅 noise_paradigm=ddpm 时生效)
+  noise_offset: 0.05                # 通道级随机偏移；平面图以白底黑线为主，0.05 帮助模型学习全局亮度分布
+  min_snr_gamma: 5.0                # Min-SNR 时间步加权 (论文推荐 5.0)；抑制高噪声步的梯度噪声，全参微调更稳定
+  prediction_type: "epsilon"        # "epsilon"=预测噪声(标准DDPM)，"v_prediction"=预测速度(更接近FM，可选)
+
+  # ── 空间 / 通道加权 Loss (仅 noise_paradigm=ddpm 时生效) ──
+  # 切换方式:
+  #   原版 MSE:    spatial_weight_scale=0, channel_0_weight=1.0
+  #   加权 MSE:    spatial_weight_scale=4.0, channel_0_weight=2.0
+  # 两者可独立开关，也可同时启用
+  # spatial_weight_scale: 4.0          # >0 启用空间加权: 线条权重=1+scale=5.0, 背景=1.0; 0=关闭
+  # spatial_weight_threshold: 0.1      # 亮度二值化阈值 (0~1)；黑底彩色线稿中高于此值为线条
+  # channel_0_weight: 2.0              # latent ch0 额外权重; 1.0=关闭通道加权
+
 data:
-  train_data_dir: "/home/daiqing_tan/stable_diffusion_lora/data/data/llm_1024/floor"
+  train_data_dir: "/home/daiqing_tan/stable_diffusion_lora/data/data/size_1024/floor"
   resolution: 1024
+
+  # ── 分桶策略 ──
+  # true:  按宽高比分桶，同 batch 内分辨率一致（默认，适合多比例数据集）
+  # false: 关闭分桶，所有图片等比缩放 + 居中 padding 到 resolution×resolution
+  #        此模式下 latent 缓存需重新编码（缓存目录自动切换，互不冲突）
+  use_aspect_ratio_bucketing: false
+  pad_color: [0, 0, 0]             # padding 填充色 (RGB 0-255)；黑底线稿用黑色
+
+  # ── caption 模式 ──
+  # "fixed":     所有图片共用 caption 字段的统一提示词
+  # "per_image": 每张图片从 caption_dir 读取对应的 .txt 描述文件（结构化信息）
+  caption_mode: "per_image"
+
+  # 统一提示词（caption_mode=fixed 时生效）
   caption: "architectural floor plan, blueprint, technical drawing"
+
+  # ── 逐图 caption 配置（caption_mode=per_image 时生效）──
+  # 训练前自动用 T5-XXL 对所有 .txt 预编码并缓存至 {train_data_dir}/../text_embed_per_image_cache/
+  caption_dir: "/home/daiqing_tan/stable_diffusion_lora/data/data/description"
+
+  # 图片文件名与描述文件名的映射规则:
+  #   图片:  ..._f1___total__1024.png
+  #   描述:  ..._f1_controlnet_color_1024.txt
+  # 将图片 stem 中的 from 替换为 to 即得到对应的描述文件 stem
+  caption_stem_replace:
+    from: "___total__1024"
+    to: "_controlnet_color_1024"
+
+  # 找不到对应描述文件时使用的兜底 caption（~3/3435 张无匹配）
+  caption_fallback: "architectural floor plan, blueprint, technical drawing"
 
 validation:
   prompts:
     - "architectural floor plan, blueprint, technical drawing"
+    # - "a detailed residential floor plan showing room layout"
+    # - "floor plan"
+
+  # prompt_source: 验证时文本提示词的来源
+  #   "config"  — 使用上方 prompts 列表中的每个提示词（默认，适合对比不同描述的泛化能力）
+  #   "data"    — 使用 data.caption（训练 caption），忽略 prompts 列表
+  prompt_source: "data"
+
   negative_prompt: ""
   num_inference_steps: 50
-  guidance_scale: 4.5                # PixArt-Sigma 推荐 guidance_scale=4.5
+  guidance_scale: [4.5, 2.0, 1.0]    # CFG 列表，每个值各生成一组验证图，方便对比引导强度效果
   seed: 42
   num_images_per_prompt: 4
   img2img_strength: [0.3, 0.5, 0.7]
 
-  compute_fid: true
-  fid:
-    num_real_images: 512
-    num_gen_images: 512
-    model_name: "dinov2_vitb14"
-    batch_size: 8                   # FID pipeline 推理 batch size（无梯度/无激活保留，验证期间剩余~17GB，16张无压力）
-    real_features_cache: "./outputs/pixart_sigma_floorplan/fid_real_features.npz"
+  # compute_fid: true
+  # fid:
+  #   num_real_images: 512
+  #   num_gen_images: 512
+  #   model_name: "dinov2_vitb14"
+  #   batch_size: 8                   # FID pipeline 推理 batch size（无梯度/无激活保留，验证期间剩余~17GB，16张无压力）
+  #   real_features_cache: "./outputs/pixart_sigma_floorplan/fid_real_features.npz"

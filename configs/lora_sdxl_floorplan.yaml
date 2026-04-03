@@ -17,6 +17,13 @@
 #   train_batch_size=4 per GPU, grad_accum=8, 4GPUs → effective_batch=128
 #   每 epoch 优化器步数 = ⌈3400 ÷ 128⌉ = 27 步
 #   30 epoch = 27 × 30 = 810 步
+#
+# 启动方式:
+#   bash train.sh lora sdxl              # 标准多卡
+#   bash train.sh lora sdxl resume       # 恢复训练
+#
+# FID 评估:
+#   bash train.sh eval_fid --config configs/lora_sdxl_floorplan.yaml
 # ============================================================
 
 model:
@@ -27,7 +34,7 @@ model:
 lora:
   rank: 128
   alpha: 128
-  use_qlora: true                     # 启用 QLoRA: UNet 以 NF4 量化加载，LoRA 适配器 bf16 训练
+  use_qlora: false                     # 启用 QLoRA: UNet 以 NF4 量化加载，LoRA 适配器 bf16 训练
   qlora_compute_dtype: "bf16"         # QLoRA 前向计算精度: "bf16" | "fp16"
   target_modules:
     - "to_q"
@@ -47,13 +54,14 @@ training:
   gradient_accumulation_steps: 8    # 累积 8 步 → effective batch = 4×4GPU×8accum = 128
   mixed_precision: "bf16"
   cache_latents: true             # 预计算 VAE latent，卸载 encoder 节省显存
+  # cache_text_embeddings: true   # 预计算文本嵌入并缓存；配合 caption_dir 时逐图预编码双 CLIP 嵌入
 
   validation_steps: 162             # 每 162 步验证一次（约每 6 epoch，与 save 对齐）
   save_steps: 162                   # 810 ÷ 5 = 162，均匀保存 5 个 checkpoint
   keep_last_n_checkpoints: 5
   lr_warmup_steps: 138              # ~17% 总步数（810 × 0.17 ≈ 138）
 
-  loss_type: "huber"                # Huber loss 替代 MSE，对异常值更鲁棒
+  loss_type: "mse"                # Huber loss 替代 MSE，对异常值更鲁棒
   huber_delta: 0.1                  # Huber loss delta 参数
   noise_offset: 0.1                 # 改善平面图极暗/极亮区域（线条、白底）的对比度还原
   min_snr_gamma: 5.0                # Min-SNR 加权，平衡高/低噪声步的 loss 贡献
@@ -62,6 +70,12 @@ data:
   train_data_dir: "/home/daiqing_tan/stable_diffusion_lora/data/overfit_test/train"
   resolution: 1024
   caption: "architectural floor plan, blueprint, technical drawing"
+  # ── 逐图 caption（可选，与 caption 互斥）────────────────────────────
+  # caption_dir: "/path/to/captions"        # 每张图对应一个 {image_stem}.txt 文件
+  # caption_fallback: "architectural floor plan"  # .txt 缺失时的后备 caption
+  # caption_stem_replace:                   # 图片名 → caption 文件名的映射规则
+  #   from: ""
+  #   to: ""
 
 validation:
   prompts:

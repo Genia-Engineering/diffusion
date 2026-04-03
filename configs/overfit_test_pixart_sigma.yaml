@@ -31,6 +31,9 @@
 # 启动方式:
 #   bash train.sh overfitpixart
 #   bash train.sh overfitpixart zero2  # DeepSpeed ZeRO-2
+#
+# FID 评估:
+#   bash train.sh eval_fid --config configs/overfit_test_pixart_sigma.yaml
 # ============================================================
 
 model:

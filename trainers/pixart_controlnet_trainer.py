@@ -33,6 +33,17 @@ from .base_trainer import BaseTrainer
 logger = logging.getLogger(__name__)
 
 
+def _safe_collate(batch):
+    """PyTorch 2.10+ 兼容 collate: 避免 shared storage 不可 resize 问题。"""
+    elem = batch[0]
+    if isinstance(elem, dict):
+        return {key: _safe_collate([d[key] for d in batch]) for key in elem}
+    if isinstance(elem, torch.Tensor):
+        return torch.stack([x.clone().contiguous() for x in batch], dim=0)
+    from torch.utils.data._utils.collate import default_collate
+    return default_collate(batch)
+
+
 class PixArtControlNetTrainer(BaseTrainer):
     """PixArt-Sigma ControlNet 训练器。"""
 
@@ -104,6 +115,13 @@ class PixArtControlNetTrainer(BaseTrainer):
         cache_dir = self._get_latent_cache_dir()
         conditioning_latent_cache_dir = self._get_conditioning_latent_cache_dir()
 
+        text_embed_cache_dir = (
+            self._get_text_embed_per_image_cache_dir()
+            if getattr(self, "_per_image_caption", False)
+            and self.training_cfg.get("cache_text_embeddings", False)
+            else None
+        )
+
         dataset = PixArtControlNetCachedLatentDataset(
             data_dir=data_cfg.train_data_dir,
             cache_dir=cache_dir,
@@ -117,6 +135,7 @@ class PixArtControlNetTrainer(BaseTrainer):
             fixed_caption=fixed_caption,
             t5_max_length=int(data_cfg.get("t5_max_length", 300)),
             max_train_samples=data_cfg.get("max_train_samples", None),
+            text_embed_cache_dir=text_embed_cache_dir,
         )
 
         bucket_manager = BucketManager(model_type=self.model_type)
@@ -132,6 +151,7 @@ class PixArtControlNetTrainer(BaseTrainer):
             num_workers=self.training_cfg.get("dataloader_num_workers", 4),
             pin_memory=True,
             drop_last=True,
+            collate_fn=_safe_collate,
         )
 
         return dataloader
@@ -328,10 +348,37 @@ class PixArtControlNetTrainer(BaseTrainer):
         self._precompute_latents_distributed(self._get_latent_cache_dir())
 
         # 阶段3: T5 文本嵌入预计算
-        self.text_encoder.to(self.accelerator.device)
+        # 先卸载 VAE 释放显存 — latent 预计算已完成，VAE 直到验证阶段才需要
+        self.vae.to("cpu")
+        torch.cuda.empty_cache()
+
         cache_text_embeddings = self.training_cfg.get("cache_text_embeddings", True)
+
+        caption_mode = self.config.data.get("caption_mode", "fixed")
+        self._per_image_caption = (caption_mode == "per_image") and bool(self.config.data.get("caption_dir", None))
+        if caption_mode == "per_image" and not self.config.data.get("caption_dir", None):
+            logger.warning("caption_mode='per_image' but caption_dir not set, falling back to fixed caption")
+
         if cache_text_embeddings:
-            self._precompute_text_embeddings()
+            if self._per_image_caption:
+                text_embed_cache_dir = self._get_text_embed_per_image_cache_dir()
+                need_encode = not self._per_image_text_embed_cache_exists(text_embed_cache_dir)
+                # 验证嵌入缓存也可能需要重新编码（如从 fixed 切换到 per_image 模式）
+                val_cache_file = Path(text_embed_cache_dir) / "__val_and_neg_prompts__.pt"
+                need_val_encode = not val_cache_file.exists()
+                if val_cache_file.exists():
+                    _tmp = torch.load(val_cache_file, map_location="cpu", weights_only=True)
+                    if "val_prompt_embeds_list" not in _tmp:
+                        need_val_encode = True
+                    del _tmp
+                if need_encode or need_val_encode:
+                    self.text_encoder.to(self.accelerator.device)
+                self._precompute_per_image_text_embeddings(text_embed_cache_dir)
+            else:
+                self.text_encoder.to(self.accelerator.device)
+                self._precompute_text_embeddings()
+        else:
+            self.text_encoder.to(self.accelerator.device)
 
         # 阶段4: 准备训练组件
         dataloader = self._build_dataloader()
@@ -344,14 +391,19 @@ class PixArtControlNetTrainer(BaseTrainer):
         optimizer = self.setup_optimizer(trainable_params=trainable_params)
         lr_scheduler = self.setup_lr_scheduler(optimizer, num_train_steps)
 
-        self.joint_model, optimizer, dataloader, lr_scheduler = self.accelerator.prepare(
-            self.joint_model, optimizer, dataloader, lr_scheduler,
+        self.joint_model, optimizer, dataloader = self.accelerator.prepare(
+            self.joint_model, optimizer, dataloader,
         )
 
         if not cache_text_embeddings and self.text_encoder is not None:
             self.text_encoder.to(self.accelerator.device)
 
         # 恢复训练
+        save_best = self.training_cfg.get("save_best", False)
+        best_ema_decay = float(self.training_cfg.get("best_loss_ema_decay", 0.99))
+        self._ema_loss: float | None = None
+        self._best_loss = self.ckpt_manager.load_best_metric() if save_best else float("inf")
+
         resume_dir = self.training_cfg.get("resume_from_checkpoint", None)
         if resume_dir == "latest":
             resume_dir = self.ckpt_manager.get_latest_checkpoint()
@@ -365,10 +417,26 @@ class PixArtControlNetTrainer(BaseTrainer):
             )
             self.global_step = state["step"]
             self.global_epoch = state["epoch"]
-            logger.info(f"Resumed from step {self.global_step}")
+            if save_best and "ema_loss" in state:
+                self._ema_loss = state["ema_loss"]
+                logger.info(
+                    f"Resumed from step {self.global_step}, "
+                    f"ema_loss={self._ema_loss:.6f}, best_loss={self._best_loss:.6f}"
+                )
+            else:
+                logger.info(f"Resumed from step {self.global_step}")
+        elif save_best and self._best_loss < float("inf"):
+            logger.info(f"Loaded best EMA loss from previous run: {self._best_loss:.6f}")
 
         val_cfg = self.config.get("validation", {})
-        val_prompts = list(val_cfg.get("prompts", ["a test image"]))
+        prompt_source = val_cfg.get("prompt_source", "config")
+        if prompt_source == "data":
+            if hasattr(self, "_per_image_val_captions") and self._per_image_val_captions:
+                val_prompts = self._per_image_val_captions
+            else:
+                val_prompts = [self.config.data.get("caption", "a test image")]
+        else:
+            val_prompts = list(val_cfg.get("prompts", ["a test image"]))
         val_loop = ValidationLoop(
             prompts=val_prompts,
             negative_prompt=val_cfg.get("negative_prompt", ""),
@@ -410,16 +478,29 @@ class PixArtControlNetTrainer(BaseTrainer):
                         grad_norm = grad_norm.item() if hasattr(grad_norm, 'item') else float(grad_norm)
 
                     optimizer.step()
-                    lr_scheduler.step()
                     optimizer.zero_grad()
 
                 if self.accelerator.sync_gradients:
+                    lr_scheduler.step()
                     self.global_step += 1
+                    step_loss = loss.item()
                     current_lr = lr_scheduler.get_last_lr()[0]
-                    self.log_step(loss.item(), current_lr, grad_norm)
+                    self.log_step(step_loss, current_lr, grad_norm)
 
                     progress_bar.update(1)
-                    progress_bar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{current_lr:.2e}")
+                    progress_bar.set_postfix(loss=f"{step_loss:.4f}", lr=f"{current_lr:.2e}")
+
+                    if save_best:
+                        if self._ema_loss is None:
+                            self._ema_loss = step_loss
+                        else:
+                            self._ema_loss = best_ema_decay * self._ema_loss + (1 - best_ema_decay) * step_loss
+                        self.tb_logger.log_ema_loss(self._ema_loss, self.global_step)
+
+                        if self._ema_loss < self._best_loss:
+                            self._best_loss = self._ema_loss
+                            self.tb_logger.log_best_loss(self._best_loss, self.global_step)
+                            self._save_best_checkpoint(optimizer, lr_scheduler, self._best_loss)
 
                     if self.global_step % save_steps == 0:
                         self._save_checkpoint(optimizer, lr_scheduler)
@@ -458,8 +539,11 @@ class PixArtControlNetTrainer(BaseTrainer):
 
         noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
 
-        # 文本嵌入
-        if hasattr(self, "_cached_prompt_embeds"):
+        # 文本嵌入: 逐图预编码 > 固定缓存 > 实时编码
+        if "prompt_embeds" in batch:
+            prompt_embeds = batch["prompt_embeds"].to(latents.device)
+            attention_mask = batch["prompt_attention_mask"].to(latents.device)
+        elif hasattr(self, "_cached_prompt_embeds"):
             prompt_embeds = self._cached_prompt_embeds.expand(bsz, -1, -1).to(latents.device)
             attention_mask = self._cached_prompt_attention_mask.expand(bsz, -1).to(latents.device)
         else:
@@ -509,58 +593,112 @@ class PixArtControlNetTrainer(BaseTrainer):
         if not self.accelerator.is_main_process:
             return
 
-        from diffusers import DPMSolverSDEScheduler
-        from pipelines.pixart_controlnet_pipeline import PixArtControlNetPipeline
-
         unwrapped = self.accelerator.unwrap_model(self.joint_model)
         unwrapped.controlnet.eval()
+        dev = self.accelerator.device
+        self.vae.to(dev)
 
-        inference_scheduler = DPMSolverSDEScheduler.from_config(
-            self.noise_scheduler.config, use_karras_sigmas=True,
-        )
+        try:
+            from diffusers import DPMSolverSDEScheduler
+            from pipelines.pixart_controlnet_pipeline import PixArtControlNetPipeline
 
-        pipeline = PixArtControlNetPipeline(
-            vae=self.vae,
-            transformer=unwrapped,
-            controlnet=None,
-            text_encoder=None,
-            tokenizer=None,
-            scheduler=inference_scheduler,
-        )
+            inference_scheduler = DPMSolverSDEScheduler.from_config(
+                self.noise_scheduler.config, use_karras_sigmas=True,
+            )
 
-        pipeline_kwargs_override = None
-        if hasattr(self, "_cached_prompt_embeds"):
-            dev = self.accelerator.device
-            pipeline_kwargs_override = {
-                "prompt_embeds": self._cached_prompt_embeds.to(dev),
-                "negative_prompt_embeds": self._cached_negative_prompt_embeds.to(dev),
-                "prompt_attention_mask": self._cached_prompt_attention_mask.to(dev),
-                "negative_prompt_attention_mask": self._cached_negative_prompt_attention_mask.to(dev),
-            }
+            pipeline = PixArtControlNetPipeline(
+                vae=self.vae,
+                transformer=unwrapped,
+                controlnet=None,
+                text_encoder=None,
+                tokenizer=None,
+                scheduler=inference_scheduler,
+            )
 
-        conditioning_images, ground_truth_images = self._load_val_images()
+            conditioning_images, ground_truth_images = self._load_val_images()
 
-        pipeline.set_progress_bar_config(disable=True)
-        val_loop.run(
-            pipeline,
-            self.global_step,
-            self.tb_logger,
-            device=self.accelerator.device,
-            pipeline_kwargs_override=pipeline_kwargs_override,
-            conditioning_images=conditioning_images,
-            ground_truth_images=ground_truth_images,
-        )
-        del pipeline
+            pipeline_kwargs_override = None
+            val_stems = getattr(self, "_val_matched_train_stems", [])
+            if val_stems and getattr(self, "_per_image_caption", False):
+                text_embed_cache_dir = Path(self._get_text_embed_per_image_cache_dir())
+                neg_embeds = self._cached_negative_prompt_embeds.to(dev)
+                neg_mask = self._cached_negative_prompt_attention_mask.to(dev)
+                pipeline_kwargs_override = []
+                for stem in val_stems:
+                    text_file = text_embed_cache_dir / f"{stem}.pt"
+                    text_data = torch.load(text_file, map_location=dev, weights_only=True)
+                    pipeline_kwargs_override.append({
+                        "prompt_embeds": text_data["prompt_embeds"].float().to(dev),
+                        "prompt_attention_mask": text_data["prompt_attention_mask"].to(dev),
+                        "negative_prompt_embeds": neg_embeds,
+                        "negative_prompt_attention_mask": neg_mask,
+                    })
 
-        unwrapped.controlnet.train()
+                matched_captions = self._load_captions_for_stems(val_stems)
+                val_loop.prompts = matched_captions
+            elif hasattr(self, "_cached_val_prompt_embeds_list"):
+                pipeline_kwargs_override = [
+                    {k: v.to(dev) for k, v in d.items()}
+                    for d in self._cached_val_prompt_embeds_list
+                ]
+            elif hasattr(self, "_cached_prompt_embeds"):
+                pipeline_kwargs_override = {
+                    "prompt_embeds": self._cached_prompt_embeds.to(dev),
+                    "negative_prompt_embeds": self._cached_negative_prompt_embeds.to(dev),
+                    "prompt_attention_mask": self._cached_prompt_attention_mask.to(dev),
+                    "negative_prompt_attention_mask": self._cached_negative_prompt_attention_mask.to(dev),
+                }
+
+            pipeline.set_progress_bar_config(disable=True)
+            val_loop.run(
+                pipeline,
+                self.global_step,
+                self.tb_logger,
+                device=dev,
+                pipeline_kwargs_override=pipeline_kwargs_override,
+                conditioning_images=conditioning_images,
+                ground_truth_images=ground_truth_images,
+            )
+            del pipeline
+        except Exception:
+            logger.exception(f"Validation failed at step {self.global_step}, skipping")
+        finally:
+            self.vae.to("cpu")
+            torch.cuda.empty_cache()
+            unwrapped.controlnet.train()
+
+    def _load_captions_for_stems(self, stems: list[str]) -> list[str]:
+        """根据训练图 stem 列表加载对应的 caption 文本。"""
+        data_cfg = self.config.data
+        caption_dir = Path(data_cfg.caption_dir)
+        stem_replace_cfg = data_cfg.get("caption_stem_replace", {})
+        stem_from = stem_replace_cfg.get("from", "")
+        stem_to = stem_replace_cfg.get("to", "")
+        fallback = data_cfg.get("caption_fallback", data_cfg.get("caption", ""))
+
+        captions = []
+        for stem in stems:
+            caption_stem = stem.replace(stem_from, stem_to) if stem_from else stem
+            caption_file = caption_dir / f"{caption_stem}.txt"
+            if caption_file.exists():
+                captions.append(caption_file.read_text(encoding="utf-8").strip())
+            else:
+                captions.append(fallback)
+        return captions
 
     def _load_val_images(self):
-        """加载验证用条件图像和对应训练原图。"""
+        """加载验证用条件图像和对应训练原图。
+
+        当 per_image caption 模式时，按训练图排序顺序选取对应条件图，
+        确保 conditioning_images[i], val_prompts[i], ground_truth[i] 三者配对。
+        """
         from PIL import Image as PIL_Image
-        from data.controlnet_dataset import _KNOWN_SUFFIX_PAIRS, _strip_known_suffix
+        from data.controlnet_dataset import (
+            _KNOWN_SUFFIX_PAIRS, _strip_known_suffix, _build_cond_index,
+        )
 
         val_cfg = self.config.get("validation", {})
-        n = len(list(val_cfg.get("prompts", [""])))
+        n = val_cfg.get("num_val_samples", len(list(val_cfg.get("prompts", [""]))))
         resolution = self.config.data.get("resolution", 1024)
         _IMG_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 
@@ -568,11 +706,47 @@ class PixArtControlNetTrainer(BaseTrainer):
         cond_dir_str = self.config.data.get("conditioning_data_dir", None)
 
         sampled_cond_files: list[Path] = []
+        matched_train_files: list[Path | None] = []
 
         val_cond_paths = list(val_cfg.get("val_conditioning_images", []))
         if val_cond_paths:
+            # 显式指定的验证条件图（最高优先级）
             sampled_cond_files = [Path(p) for p in val_cond_paths[:n]]
+        elif getattr(self, "_per_image_caption", False) and cond_dir_str:
+            # 逐图 caption 模式: 随机采样 n 对配对的 (训练图, 条件图)
+            import random
+            cond_dir = Path(cond_dir_str)
+            if cond_dir.exists() and train_dir.exists():
+                cond_index = _build_cond_index(cond_dir)
+                train_images = sorted(
+                    p for p in train_dir.iterdir()
+                    if p.is_file() and p.suffix.lower() in _IMG_EXTS
+                )
+                # 筛选有对应条件图的训练图，再随机抽样
+                paired: list[tuple[Path, Path]] = []
+                for img_path in train_images:
+                    fname = img_path.name
+                    base_key = None
+                    for orig_suffix, _ in _KNOWN_SUFFIX_PAIRS:
+                        base_key = _strip_known_suffix(fname, orig_suffix)
+                        if base_key is not None:
+                            break
+                    if base_key is None:
+                        base_key = img_path.stem
+                    cond_path = cond_index.get(base_key)
+                    if cond_path is not None:
+                        paired.append((img_path, cond_path))
+
+                rng = random.Random(val_cfg.get("seed", 42))
+                selected = rng.sample(paired, min(n, len(paired)))
+                for train_path, cond_path in selected:
+                    matched_train_files.append(train_path)
+                    sampled_cond_files.append(cond_path)
+                logger.info(
+                    f"验证条件图（随机配对采样, seed={val_cfg.get('seed', 42)}）：{[f.name for f in sampled_cond_files]}"
+                )
         elif cond_dir_str:
+            # 固定 caption 模式: 随机采样（条件图之间无需与特定 caption 配对）
             cond_path = Path(cond_dir_str)
             if cond_path.exists():
                 files = sorted(
@@ -594,8 +768,22 @@ class PixArtControlNetTrainer(BaseTrainer):
             for f in sampled_cond_files
         ]
 
+        # 记录匹配到的训练图 stem，供 _run_validation 加载对应嵌入
+        self._val_matched_train_stems = [
+            f.stem if f is not None else None for f in matched_train_files
+        ] if matched_train_files else []
+
+        # 加载 ground truth（训练原图）
         ground_truth_images = None
-        if train_dir.exists():
+        if matched_train_files:
+            # 逐图模式: 已有精确配对
+            gt_images = [
+                PIL_Image.open(f).convert("RGB").resize((resolution, resolution))
+                if f is not None else None
+                for f in matched_train_files
+            ]
+        elif train_dir.exists():
+            # 固定 caption / 显式条件图: 通过 base_key 反查训练图
             gt_images = []
             train_index: dict[str, Path] = {}
             for f in train_dir.iterdir():
@@ -625,15 +813,17 @@ class PixArtControlNetTrainer(BaseTrainer):
                     )
                 else:
                     gt_images.append(None)
+        else:
+            gt_images = []
 
-            if any(img is not None for img in gt_images):
-                placeholder = PIL_Image.new("RGB", (resolution, resolution), (128, 128, 128))
-                ground_truth_images = [
-                    img if img is not None else placeholder for img in gt_images
-                ]
-                logger.info(
-                    f"验证原图加载：{sum(1 for img in gt_images if img is not None)}/{n} 张匹配成功"
-                )
+        if gt_images and any(img is not None for img in gt_images):
+            placeholder = PIL_Image.new("RGB", (resolution, resolution), (128, 128, 128))
+            ground_truth_images = [
+                img if img is not None else placeholder for img in gt_images
+            ]
+            logger.info(
+                f"验证原图加载：{sum(1 for img in gt_images if img is not None)}/{len(gt_images)} 张匹配成功"
+            )
 
         return conditioning_images, ground_truth_images
 
@@ -646,6 +836,22 @@ class PixArtControlNetTrainer(BaseTrainer):
         self.ckpt_manager.save(
             step=self.global_step,
             global_epoch=self.global_epoch,
+            controlnet=self.controlnet,
+            optimizer=optimizer,
+            lr_scheduler=lr_scheduler,
+            seed=self.training_cfg.get("seed", 42),
+            is_lora=False,
+            ema_loss=self._ema_loss,
+        )
+
+    def _save_best_checkpoint(self, optimizer, lr_scheduler, best_loss: float):
+        if not self.accelerator.is_main_process:
+            return
+
+        self.ckpt_manager.save_best(
+            step=self.global_step,
+            global_epoch=self.global_epoch,
+            best_metric_value=best_loss,
             controlnet=self.controlnet,
             optimizer=optimizer,
             lr_scheduler=lr_scheduler,

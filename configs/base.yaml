@@ -27,7 +27,7 @@ training:
   dataloader_num_workers: 4
   cache_text_embeddings: true       # 预计算并缓存文本嵌入，卸载文本编码器节省显存（仅当 train_text_encoder=false 时生效）
   cache_latents: true              # 预计算所有图片的 VAE latent 存磁盘，训练时跳过 VAE encode，并卸载 encoder 节省显存
-  # latent_cache_dir: 各子配置按需指定；未指定时自动放在 train_data_dir 同级的 latent_cache/
+  # latent_cache_dir: 各子配置按需指定；未指定时自动放在 train_data_dir 同级的 latent_cache_{model_type}/
 
   # 保存与验证间隔
   validation_steps: 500             # 每 500 step 生成验证图像
@@ -38,6 +38,7 @@ data:
   center_crop: false
   random_flip: true
   use_aspect_ratio_bucketing: true
+  pad_color: [0, 0, 0]               # padding 填充色 (RGB 0-255)，仅 use_aspect_ratio_bucketing=false 时生效
 
 validation:
   prompts:

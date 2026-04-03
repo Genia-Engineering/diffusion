@@ -7,6 +7,13 @@
 #   UNet(bf16) ~5.2GB + VAE(bf32) ~0.3GB + ControlNet(bf16) ~5GB
 #   + TE1-CLIP-L(frozen) ~0.25GB + TE2-OpenCLIP-G(frozen) ~1.4GB
 #   + Activations(梯度检查点+SDPA) ~8GB ≈ 20-21GB
+#
+# 启动方式:
+#   bash train.sh controlnet sdxl              # 标准多卡
+#   bash train.sh controlnet sdxl resume       # 恢复训练
+#
+# FID 评估:
+#   bash train.sh eval_fid --config configs/controlnet_sdxl.yaml
 # ============================================================
 
 model:

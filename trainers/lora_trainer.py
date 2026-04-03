@@ -185,6 +185,22 @@ class LoRATrainer(BaseTrainer):
         fixed_caption = data_cfg.get("caption", "")
         cache_latents = self.training_cfg.get("cache_latents", False)
 
+        # 逐图 caption 相关参数
+        caption_dir = data_cfg.get("caption_dir", None)
+        caption_stem_replace = dict(data_cfg.get("caption_stem_replace", {})) if data_cfg.get("caption_stem_replace") else None
+        caption_fallback = data_cfg.get("caption_fallback", "")
+
+        # 预编码文本嵌入缓存目录（仅当 cache_text_embeddings + 逐图 caption 时传入）
+        sdxl_text_embed_cache_dir = (
+            self._get_text_embed_per_image_cache_dir()
+            if (
+                self.model_type == "sdxl"
+                and getattr(self, "_per_image_caption", False)
+                and self.training_cfg.get("cache_text_embeddings", False)
+            )
+            else None
+        )
+
         if cache_latents:
             cache_dir = self._get_latent_cache_dir()
             if self.model_type == "sdxl":
@@ -196,6 +212,7 @@ class LoRATrainer(BaseTrainer):
                     resolution=resolution,
                     random_flip=data_cfg.get("random_flip", True),
                     fixed_caption=fixed_caption,
+                    text_embed_cache_dir=sdxl_text_embed_cache_dir,
                 )
             else:
                 dataset = SD15CachedLatentDataset(
@@ -215,6 +232,9 @@ class LoRATrainer(BaseTrainer):
                 center_crop=data_cfg.get("center_crop", False),
                 random_flip=data_cfg.get("random_flip", True),
                 fixed_caption=fixed_caption,
+                caption_dir=caption_dir,
+                caption_stem_replace=caption_stem_replace,
+                caption_fallback=caption_fallback,
             )
         else:
             dataset = SD15Dataset(
@@ -324,6 +344,7 @@ class LoRATrainer(BaseTrainer):
     def train(self):
         """LoRA 主训练循环。"""
         cache_latents = self.training_cfg.get("cache_latents", False)
+        cache_text_embeddings = self.training_cfg.get("cache_text_embeddings", False)
 
         # VAE 提前上 GPU：latent 预计算（如需）在 accelerator.prepare 之前完成
         self.vae.to(self.accelerator.device, dtype=torch.float32)
@@ -331,6 +352,22 @@ class LoRATrainer(BaseTrainer):
         # 分布式安全预计算：文件信号代替 NCCL barrier，避免 10 分钟超时崩溃
         if cache_latents:
             self._precompute_latents_distributed(self._get_latent_cache_dir())
+
+        # ── 逐图 caption 文本嵌入预计算（须在 accelerator.prepare 之前，避免 OOM）──
+        self._per_image_caption = bool(self.config.data.get("caption_dir", None))
+        if (
+            cache_text_embeddings
+            and self._per_image_caption
+            and not self.train_te
+            and not self.train_te2
+        ):
+            text_embed_cache_dir = self._get_text_embed_per_image_cache_dir()
+            need_encode = not self._per_image_text_embed_cache_exists(text_embed_cache_dir)
+            if need_encode:
+                self.text_encoder.to(self.accelerator.device)
+                if self.text_encoder_2 is not None:
+                    self.text_encoder_2.to(self.accelerator.device)
+            self._precompute_per_image_text_embeddings(text_embed_cache_dir)
 
         dataloader = self._build_dataloader()
         num_train_steps = self.training_cfg.get("num_train_steps", 5000)
@@ -357,7 +394,7 @@ class LoRATrainer(BaseTrainer):
             models_to_prepare.append(self.text_encoder_2)
 
         prepared = self.accelerator.prepare(
-            *models_to_prepare, optimizer, dataloader, lr_scheduler
+            *models_to_prepare, optimizer, dataloader
         )
         idx = 0
         self.unet = prepared[idx]; idx += 1
@@ -367,16 +404,17 @@ class LoRATrainer(BaseTrainer):
             self.text_encoder_2 = prepared[idx]; idx += 1
         optimizer = prepared[idx]; idx += 1
         dataloader = prepared[idx]; idx += 1
-        lr_scheduler = prepared[idx]; idx += 1
 
         # VAE 已在 train() 开头移到 device，此处无需重复（保留文本编码器移动）
-        if not self.train_te:
+        if self.text_encoder is not None and not self.train_te:
             self.text_encoder.to(self.accelerator.device)
         if self.text_encoder_2 is not None and not self.train_te2:
             self.text_encoder_2.to(self.accelerator.device)
 
+        # 固定 caption 文本嵌入预计算（逐图 caption 已在 accelerator.prepare 之前完成）
         if (
-            self.training_cfg.get("cache_text_embeddings", False)
+            cache_text_embeddings
+            and not self._per_image_caption
             and not self.train_te
             and not self.train_te2
         ):
@@ -471,10 +509,10 @@ class LoRATrainer(BaseTrainer):
                         grad_norm = grad_norm.item() if hasattr(grad_norm, 'item') else float(grad_norm)
 
                     optimizer.step()
-                    lr_scheduler.step()
                     optimizer.zero_grad()
 
                 if self.accelerator.sync_gradients:
+                    lr_scheduler.step()
                     self.global_step += 1
                     current_lr = lr_scheduler.get_last_lr()[0]
                     self.log_step(loss.item(), current_lr, grad_norm)
@@ -541,7 +579,10 @@ class LoRATrainer(BaseTrainer):
         noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
 
         if self.model_type == "sdxl":
-            if hasattr(self, "_cached_prompt_embeds"):
+            if "prompt_embeds" in batch:
+                prompt_embeds = batch["prompt_embeds"].to(latents.device)
+                pooled_prompt_embeds = batch["pooled_prompt_embeds"].to(latents.device)
+            elif hasattr(self, "_cached_prompt_embeds"):
                 prompt_embeds = self._cached_prompt_embeds.expand(bsz, -1, -1).to(latents.device)
                 pooled_prompt_embeds = self._cached_pooled_prompt_embeds.expand(bsz, -1).to(latents.device)
             else:

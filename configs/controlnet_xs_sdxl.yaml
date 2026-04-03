@@ -14,6 +14,13 @@
 #   UNetControlNetXSModel(bf16) ~5.5GB + VAE(bf32) ~0.3GB
 #   + TE1-CLIP-L(frozen) ~0.25GB + TE2-OpenCLIP-G(frozen) ~1.4GB
 #   + Activations(梯度检查点+SDPA) ~6GB ≈ 13-14GB
+#
+# 启动方式:
+#   bash train.sh controlnetxs sdxl              # 标准多卡
+#   bash train.sh controlnetxs sdxl resume       # 恢复训练
+#
+# FID 评估:
+#   bash train.sh eval_fid --config configs/controlnet_xs_sdxl.yaml
 # ============================================================
 
 model:
@@ -27,22 +34,26 @@ controlnet:
   conditioning_channels: 3
 
 controlnet_xs:
-  size_ratio: null                 # null 使用 diffusers 默认值；可设为 0.1 等自定义比例
+  size_ratio: 0.2                  # adapter / base 参数比例；SDXL 下 0.1 ≈ 48M adapter
+  no_ctrl_cross_attention: false    # 移除 ctrl 分支的 cross-attention，仅保留 ResNet
+                                   # ctrl 不再直接处理文本嵌入，文本语义通过 base→ctrl 投射间接传递
+                                   # 与 PixArt-Sigma XS 设计一致
 
 training:
   output_dir: "./outputs/controlnet_xs_sdxl"
-  num_train_steps: 17000
-  learning_rate: 1.0e-5
-  train_batch_size: 2
+  num_train_steps: 1500
+  learning_rate: 2.0e-4
+  train_batch_size: 8
   gradient_accumulation_steps: 4
   mixed_precision: "bf16"
   cache_latents: true
+  latent_cache_batch_size: 16
   cache_text_embeddings: true
 
-  validation_steps: 850
-  save_steps: 2125
-  keep_last_n_checkpoints: 6
-  lr_warmup_steps: 500
+  validation_steps: 200
+  save_steps: 200
+  keep_last_n_checkpoints: 15
+  lr_warmup_steps: 100
 
   gradient_checkpointing: true
   attention_backend: "sdpa"
@@ -65,12 +76,70 @@ data:
   random_flip: true
 
 validation:
+  # 验证样本数: 从训练集随机抽取 N 对 (条件图, caption, ground truth)
+  num_val_samples: 4
+
+  # prompt_source: 验证时文本提示词的来源
+  #   "config"  — 使用下方 prompts 列表（适合对比不同描述的泛化能力）
+  #   "data"    — 使用训练数据中的逐图 caption（与 caption_mode=per_image 配合）
+  prompt_source: "config"
+
+  # caption_mode=fixed 或 prompt_source=config 时使用
   prompts:
     - "architectural floor plan, blueprint, technical drawing"
-    - "architectural floor plan, blueprint, technical drawing"
-    - "architectural floor plan, blueprint, technical drawing"
-    - "architectural floor plan, blueprint, technical drawing"
+
   negative_prompt: "blurry, noisy, low quality, photo"
   num_inference_steps: 25
   guidance_scale: 7.5
   seed: 42
+  num_images_per_prompt: 1
+
+# ── 辅助结构 loss ──────────────────────────────────────────────────
+#
+# 目的: 让模型更好地学习控制图中各颜色块对应区域的结构信息，
+#       只关注"该位置是否有内容"，不关注具体颜色。
+#
+# 计算流程:
+#   1. 从 batch 中随机抽取 ≤ max_decode_samples 个样本
+#   2. 由 noise_pred 可微地推算 x0_pred（去噪后的潜变量）
+#   3. VAE decode x0_pred → 像素空间 RGB（VAE 权重冻结，梯度穿过回传到 UNet-XS）
+#   4. 归一化到 [0,1]，取 max(R,G,B) 得到单通道结构图 ← 消除颜色干扰
+#   5. 对预测: sigmoid 软阈值二值化 → pred_soft ∈ [0,1]（可微）
+#      对原图: 预缓存时已做硬阈值二值化 → orig_binary ∈ {0,1}
+#   6. 从控制图构建 per-label 空间权重 weight_mask（背景=0，前景按 label 赋权）
+#   7. loss = Σ[(pred_soft - orig_binary)² × weight_mask × t_quality] / fg_count
+#      - weight_mask 在平方之后线性加权（避免 w² 放大）
+#      - t_quality = 1 - t/threshold 线性衰减（低 t 预测更可靠，权重更高）
+#      - fg_count 前景像素归一化，避免背景面积稀释
+#
+# 如何消除颜色干扰:
+#   max(R,G,B) 将任何颜色的像素映射为亮度值，再经 sigmoid 阈值化变为近似 0/1，
+#   因此蓝色门、红色墙、绿色窗在该表示下完全等价（均为 ~1），
+#   模型只需学习"此处有内容"而非"此处是什么颜色"。
+#
+# 梯度流: aux_loss → pixel MSE → VAE decode(冻结) → x0_pred → noise_pred → UNet-XS
+#         VAE 不更新权重，仅作为梯度传导的桥梁。
+#
+auxiliary_loss:
+  enabled: true
+  weight: 0.003                    # total_loss = diffusion_loss + weight × aux_loss
+  timestep_threshold: 500        # 所有 timestep 均计算 (t_quality 线性衰减自动降权高 t)
+  fg_threshold: 0.1               # 前景判定阈值 (归一化 [0,1] 后, 背景≈0, 前景>0.1)
+  temperature: 20.0               # 预测侧软阈值陡峭度 (越大越接近硬阈值)
+  max_decode_samples: 2           # 每步最多 VAE decode 的样本数 (控制显存)
+  bg_weight: 0.0                  # 背景区域权重 (0=完全忽略背景)
+  labels:                         # 控制图中各语义 label 的 RGB 颜色与权重
+    - rgb: [220, 120, 0]          # label_6_deck    平台/甲板 (橙色)
+      weight: 0.0
+    - rgb: [220, 0, 0]            # label_4_doors   门 (红色) ← 消融测试：仅监督门
+      weight: 5.0
+    - rgb: [20, 50, 230]          # label_5_general_opening  通用开口 (蓝色)
+      weight: 0.0
+    - rgb: [230, 230, 230]        # label_7_walls   墙体 (浅灰)
+      weight: 0.0
+    - rgb: [220, 220, 0]          # label_5_stair_opening  楼梯开口 (黄色)
+      weight: 0.0
+    - rgb: [0, 200, 0]            # label_4_windows 窗户 (绿色)
+      weight: 0.0
+    - rgb: [180, 0, 200]          # label_8_posts   立柱/柱子 (紫色)
+      weight: 0.0

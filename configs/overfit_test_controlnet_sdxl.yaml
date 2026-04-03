@@ -15,6 +15,12 @@
 # 预计耗时（4× A10G）：
 #   800 步 × ~5s/step ≈ ~67 min
 #   触发 8 次验证（每 100 步），可观察收敛曲线
+#
+# 启动方式:
+#   bash train.sh overfit
+#
+# FID 评估:
+#   bash train.sh eval_fid --config configs/overfit_test_controlnet_sdxl.yaml
 # ============================================================
 
 model:

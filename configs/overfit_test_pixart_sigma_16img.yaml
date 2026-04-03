@@ -18,6 +18,9 @@
 #
 # 启动方式:
 #   bash train.sh overfitpixart16img
+#
+# FID 评估:
+#   bash train.sh eval_fid --config configs/overfit_test_pixart_sigma_16img.yaml
 # ============================================================
 
 model:
