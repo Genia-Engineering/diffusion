@@ -1,39 +1,56 @@
 # ============================================================
-# PixArt-Sigma ControlNet-XS 训练配置 — 建筑平面图
-# 硬件: 4× NVIDIA A10G (23GB each)
+# PixArt-Sigma ControlNet-XS 配置 — 建筑平面图
+# 硬件: 1× NVIDIA A10G (23GB)
 # 数据集: ~3400 张 1024×1024 PNG
 #
-# 架构: PixArt-Sigma DiT (冻结) + ControlNet-XS Adapter (可训练)
+# 架构: PixArt-Sigma DiT + ControlNet-XS Adapter
 #   - XS Adapter: 14 个薄型 block (control_dim=288, 无 cross-attention)
 #   - 双向投射: base(1152) ↔ control(288), control→base 零初始化
 #   - CNN 编码器: 条件图在线通过轻量 CNN 编码（无需 VAE 预缓存）
-#   - 参数量: ~24M (base 611M 的 ~3.9%)
 #
-# 显存估算 (per GPU, bf16, gc=ON, cache_latents+cache_text):
-#   Transformer(bf16, frozen) ~1.2GB + XS Adapter+CNN(bf16) ~0.06GB
-#   + Adam优化器(fp32) ~0.19GB + 梯度 ~0.05GB
-#   + 激活值(梯度检查点, batch=4) ~4.5GB → 合计 ~6GB
+# ── 训练模式 (通过 controlnet.train_transformer 切换) ──────────
 #
-# 步数推算:
-#   train_batch_size=4 per GPU, grad_accum=4, 4GPUs → effective_batch=64
-#   每 epoch 约 54 步，60 epoch = 3240 步
+#  train_transformer: true  → 全参微调 (Transformer + XS Adapter)
+#    参数量: ~611M + ~24M = ~635M 全部可训练
+#    推荐 lr: 1e-4 (Transformer), 可选 controlnet_lr: 2e-4 (XS Adapter)
+#    显存: ~11GB (bf16, gc=ON, batch=4)
+#
+#  train_transformer: false → 仅训练 XS Adapter, 冻结 Transformer
+#    参数量: ~24M 可训练 (3.9% of base)
+#    推荐 lr: 2e-4 ~ 5e-4
+#    显存: ~5GB (bf16, gc=ON, batch=4)
+#
+# 训练范式: DDPM (epsilon prediction)
+#   - 分桶关闭: 所有图片等比缩放 + 居中 padding 到 1024×1024
+#   - 控制图与原图保持一致的 padding 处理
 #
 # 启动方式:
-#   bash train.sh pixart_cnxs           # 标准多卡
+#   bash train.sh pixart_cnxs           # 标准训练
 #   bash train.sh pixart_cnxs resume    # 恢复训练
-#
-# FID 评估:
-#   bash train.sh eval_fid --config configs/controlnet_xs_pixart_sigma.yaml
 # ============================================================
 
 model:
   pretrained_model_name_or_path: "PixArt-alpha/PixArt-Sigma-XL-2-1024-MS"
   model_type: "pixart_sigma"
   weights_dir: "/home/daiqing_tan/stable_diffusion_lora/weights"
+  # 微调后的 Transformer 权重路径（可选）
+  # 设置后将覆盖 pretrained 权重，用领域适配后的 Transformer 初始化
+  # 注释掉或留空则使用原始预训练权重
+  # finetuned_transformer_path: "./outputs/pixart_sigma_floorplan/checkpoints/step_003600/transformer"
 
 controlnet:
   conditioning_mode: "cnn_encoder"
   conditioning_type: "precomputed"
+
+  # ── 训练模式 ──
+  # true  = 全参微调: Transformer + XS Adapter 均可训练
+  # false = 冻结 Transformer, 仅训练 XS Adapter (~24M, 3.9% of base)
+  train_transformer: true
+
+  # ── ControlNet 独立学习率（可选，仅 train_transformer=true 时生效）──
+  # 设置后 XS Adapter 使用此 lr，Transformer 使用 training.learning_rate
+  # 注释掉或设为 0 则 Transformer 和 XS Adapter 共享同一 learning_rate
+  # controlnet_lr: 2.0e-4
 
 controlnet_xs:
   num_layers: 14                        # XS block 数量
@@ -42,50 +59,58 @@ controlnet_xs:
 
 training:
   output_dir: "./outputs/controlnet_xs_pixart_sigma"
-  num_train_steps: 3240                 # 60 epoch
-  learning_rate: 2.0e-4                 # XS adapter 参数少，可用更高学习率
-  train_batch_size: 2
-  gradient_accumulation_steps: 4        # effective batch = 4×4GPU×4accum = 64
+  num_train_steps: 3600                 # ~60 epoch
+  # 全参模式推荐 1e-4, 仅 ControlNet 模式推荐 2e-4 ~ 5e-4
+  learning_rate: 1.0e-4
+  train_batch_size: 4
+  gradient_accumulation_steps: 4        # effective batch = 2×1GPU×4accum = 8
   mixed_precision: "bf16"
   cache_latents: true
   cache_text_embeddings: true
   latent_cache_batch_size: 4
 
-  validation_steps: 200                 # 每 6 epoch 验证一次
-  save_steps: 200                       # 每 10 epoch 保存一次
-  keep_last_n_checkpoints: 15
+  validation_steps: 300
+  save_steps: 300
+  keep_last_n_checkpoints: 12
 
-  save_best: true                       # 保存最佳权重（基于 EMA loss）
-  best_loss_ema_decay: 0.99             # EMA 平滑系数，越大越平滑
-  lr_warmup_steps: 162                  # ~5% 总步数
+  save_best: true
+  best_loss_ema_decay: 0.99
+  lr_warmup_steps: 150                  # 前 ~10% 总步数 warmup
   gradient_checkpointing: true
   attention_backend: "sdpa"
   allow_tf32: true
   dataloader_num_workers: 8
 
-  loss_type: "huber"
-  huber_delta: 0.1
-  noise_offset: 0.1
+  # 噪声范式: DDPM (epsilon prediction)
+  noise_paradigm: "ddpm"
+  prediction_type: "epsilon"
+  loss_type: "mse"
+  noise_offset: 0.05
   min_snr_gamma: 5.0
+  caption_dropout_rate: 0.1
 
 data:
   train_data_dir: "/home/daiqing_tan/stable_diffusion_lora/data/data/size_1024/floor"
   conditioning_data_dir: "/home/daiqing_tan/stable_diffusion_lora/data/data/size_1024_controlnet/floor"
   resolution: 1024
-  use_aspect_ratio_bucketing: true
+
+  # ── 分桶策略 ──
+  # true:  按宽高比分桶，同 batch 内分辨率一致
+  # false: 关闭分桶，所有图片等比缩放 + 居中 padding 到 resolution×resolution
+  #        控制图与原图使用相同的 padding 处理，保证空间对齐
+  use_aspect_ratio_bucketing: false
+  pad_color: [0, 0, 0]                 # padding 填充色 (RGB 0-255)
+
   center_crop: false
   random_flip: true
   t5_max_length: 300
 
   # ── caption 模式 ──
-  # "fixed":     所有图片共用 caption 字段的统一提示词
-  # "per_image": 每张图片从 caption_dir 读取对应的 .txt 描述文件
-  caption_mode: "per_image"
+  caption_mode: "fixed"
 
-  # 统一提示词（caption_mode=fixed 时生效，per_image 模式下作为 fallback）
   caption: "architectural floor plan, blueprint, technical drawing"
 
-  # ── 逐图 caption 配置（caption_mode=per_image 时生效）──
+  # ── 逐图 caption 配置 ──
   caption_dir: "/home/daiqing_tan/stable_diffusion_lora/data/data/description"
   caption_stem_replace:
     from: "___total__1024"
@@ -93,15 +118,10 @@ data:
   caption_fallback: "architectural floor plan, blueprint, technical drawing"
 
 validation:
-  # 验证样本数: 从训练集随机抽取 N 对 (条件图, caption, ground truth)
   num_val_samples: 4
 
-  # prompt_source: 验证时文本提示词的来源
-  #   "config"  — 使用下方 prompts 列表（适合对比不同描述的泛化能力）
-  #   "data"    — 使用训练数据中的逐图 caption（与 caption_mode=per_image 配合）
-  prompt_source: "data"
+  prompt_source: "config"
 
-  # caption_mode=fixed 或 prompt_source=config 时使用
   prompts:
     - "architectural floor plan, blueprint, technical drawing"
 
@@ -110,3 +130,56 @@ validation:
   guidance_scale: 4.5
   seed: 42
   num_images_per_prompt: 1
+
+# ── 辅助结构 loss ──────────────────────────────────────────────────
+#
+# 目的: 让模型更好地学习控制图中各颜色块对应区域的结构信息，
+#       只关注"该位置是否有内容"，不关注具体颜色。
+#
+# 计算流程:
+#   1. 从 batch 中随机抽取 ≤ max_decode_samples 个样本
+#   2. 由 noise_pred 可微地推算 x0_pred（去噪后的潜变量）
+#   3. VAE decode x0_pred → 像素空间 RGB（VAE 权重冻结，梯度穿过回传到模型）
+#   4. 归一化到 [0,1]，取 max(R,G,B) 得到单通道结构图 ← 消除颜色干扰
+#   5. 对预测: sigmoid 软阈值二值化 → pred_soft ∈ [0,1]（可微）
+#      对原图: 预缓存时已做硬阈值二值化 → orig_binary ∈ {0,1}
+#   6. 从控制图构建 per-label 空间权重 weight_mask（背景=0，前景按 label 赋权）
+#   7. loss = Σ[(pred_soft - orig_binary)² × weight_mask × t_quality] / fg_count
+#      - weight_mask 在平方之后线性加权（避免 w² 放大）
+#      - t_quality = 1 - t/threshold 线性衰减（低 t 预测更可靠，权重更高）
+#      - fg_count 前景像素归一化，避免背景面积稀释
+#
+# 如何消除颜色干扰:
+#   max(R,G,B) 将任何颜色的像素映射为亮度值，再经 sigmoid 阈值化变为近似 0/1，
+#   因此蓝色门、红色墙、绿色窗在该表示下完全等价（均为 ~1），
+#   模型只需学习"此处有内容"而非"此处是什么颜色"。
+#
+# 梯度流: aux_loss → pixel MSE → VAE decode(冻结) → x0_pred → noise_pred → Model
+#         VAE 不更新权重，仅作为梯度传导的桥梁。
+#
+# 注意: 启用辅助 loss 时，VAE decoder 需常驻 GPU，会额外占用 ~200MB 显存。
+#       conditioning_mode 必须为 "cnn_encoder"（需要像素空间控制图构建 weight_mask）。
+#
+auxiliary_loss:
+  enabled: false
+  weight: 0.003                    # total_loss = diffusion_loss + weight × aux_loss
+  timestep_threshold: 500          # 所有 timestep 均计算 (t_quality 线性衰减自动降权高 t)
+  fg_threshold: 0.1                # 前景判定阈值 (归一化 [0,1] 后, 背景≈0, 前景>0.1)
+  temperature: 20.0                # 预测侧软阈值陡峭度 (越大越接近硬阈值)
+  max_decode_samples: 2            # 每步最多 VAE decode 的样本数 (控制显存)
+  bg_weight: 0.0                   # 背景区域权重 (0=完全忽略背景)
+  labels:                          # 控制图中各语义 label 的 RGB 颜色与权重
+    - rgb: [220, 120, 0]           # label_6_deck    平台/甲板 (橙色)
+      weight: 0.0
+    - rgb: [220, 0, 0]             # label_4_doors   门 (红色) ← 消融测试：仅监督门
+      weight: 5.0
+    - rgb: [20, 50, 230]           # label_5_general_opening  通用开口 (蓝色)
+      weight: 0.0
+    - rgb: [230, 230, 230]         # label_7_walls   墙体 (浅灰)
+      weight: 0.0
+    - rgb: [220, 220, 0]           # label_5_stair_opening  楼梯开口 (黄色)
+      weight: 0.0
+    - rgb: [0, 200, 0]             # label_4_windows 窗户 (绿色)
+      weight: 0.0
+    - rgb: [180, 0, 200]           # label_8_posts   立柱/柱子 (紫色)
+      weight: 0.0

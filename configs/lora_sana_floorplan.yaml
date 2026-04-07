@@ -1,0 +1,85 @@
+# ============================================================
+# Sana 0.6B LoRA 微调配置 — 建筑平面图
+# 训练范式: Rectified Flow (Flow Matching) + LoRA 低秩适配
+# 硬件: 4× NVIDIA A10G (23GB each)
+# 数据集: ~3400 张 1024×1024 PNG，逐图 caption
+#
+# LoRA 注入目标:
+#   SanaTransformer2DModel 的注意力层 (nn.Linear):
+#     to_q, to_k, to_v, to_out.0
+#   FFN 使用 GLUMBConv (Conv2d)，LoRALinear 不支持，已跳过
+#
+# 启动方式:
+#   bash train.sh sana_lora             # 标准多卡
+#   bash train.sh sana_lora resume      # 恢复训练
+# ============================================================
+
+model:
+  pretrained_model_name_or_path: "Efficient-Large-Model/Sana_600M_1024px_diffusers"
+  model_type: "sana"
+  weights_dir: "/home/daiqing_tan/stable_diffusion_lora/weights"
+
+lora:
+  rank: 64
+  alpha: 64
+  target_modules:
+    - "to_q"
+    - "to_k"
+    - "to_v"
+    - "to_out.0"
+
+training:
+  output_dir: "./outputs/sana_lora_floorplan"
+  num_train_steps: 3000
+  learning_rate: 5.0e-5
+  train_batch_size: 16
+  gradient_accumulation_steps: 2
+  mixed_precision: "bf16"
+  cache_latents: true
+  cache_text_embeddings: true
+  latent_cache_batch_size: 8
+
+  validation_steps: 300
+  save_steps: 300
+  keep_last_n_checkpoints: 10
+  lr_warmup_steps: 100
+  caption_dropout_rate: 0.1
+  gradient_checkpointing: true
+  compile_model: false
+  max_grad_norm: 100.0
+  loss_type: "huber"
+  huber_delta: 0.1
+  adam_weight_decay: 0.0
+
+  # 噪声范式
+  noise_paradigm: "flow_matching"
+
+  # Flow Matching 参数
+  timestep_sampling: "logit_normal"
+  logit_mean: 0.0
+  logit_std: 1.0
+  scheduler_shift: 3.0
+
+data:
+  train_data_dir: "/home/daiqing_tan/stable_diffusion_lora/data/data/size_1024/floor"
+  resolution: 1024
+
+  caption_mode: "per_image"
+  caption: "architectural floor plan, blueprint, technical drawing"
+
+  caption_dir: "/home/daiqing_tan/stable_diffusion_lora/data/data/description"
+  caption_stem_replace:
+    from: "___total__1024"
+    to: "_controlnet_color_1024"
+  caption_fallback: "architectural floor plan, blueprint, technical drawing"
+
+validation:
+  prompt_source: "data"
+  num_val_prompts: 4
+  prompts:
+    - "architectural floor plan, blueprint, technical drawing"
+  negative_prompt: ""
+  num_inference_steps: 20
+  guidance_scale: [4.5, 2.0, 1.0, 0.0]
+  seed: 42
+  num_images_per_prompt: 2

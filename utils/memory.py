@@ -94,14 +94,30 @@ def _apply_attention_backend(model: nn.Module, name: str, backend: str) -> None:
 
 
 def _enable_sdpa(model: nn.Module, name: str) -> None:
-    """启用 PyTorch 原生 Scaled Dot-Product Attention (FlashAttention/MemEfficient/Math)。"""
+    """启用 PyTorch 原生 Scaled Dot-Product Attention (FlashAttention/MemEfficient/Math)。
+
+    对于已使用专用注意力处理器的模型（如 Sana 的 SanaLinearAttnProcessor2_0），
+    跳过替换以避免破坏模型特定的注意力机制。
+    """
     try:
-        if hasattr(model, "set_attn_processor"):
-            from diffusers.models.attention_processor import AttnProcessor2_0
-            model.set_attn_processor(AttnProcessor2_0())
-            logger.info(f"SDPA (AttnProcessor2_0) enabled for {name}")
-        else:
+        if not hasattr(model, "set_attn_processor"):
             logger.info(f"{name} does not support set_attn_processor, using default attention")
+            return
+
+        from diffusers.models.attention_processor import AttnProcessor2_0
+
+        current_procs = model.attn_processors
+        proc_types = {type(p).__name__ for p in current_procs.values()}
+        generic_types = {"AttnProcessor", "AttnProcessor2_0", "XFormersAttnProcessor"}
+        if proc_types and not proc_types.issubset(generic_types):
+            logger.info(
+                f"{name} uses specialized attention processors ({proc_types}), "
+                f"skipping AttnProcessor2_0 override to preserve model-specific attention"
+            )
+            return
+
+        model.set_attn_processor(AttnProcessor2_0())
+        logger.info(f"SDPA (AttnProcessor2_0) enabled for {name}")
     except Exception as e:
         logger.warning(f"Could not enable SDPA for {name}: {e}")
 

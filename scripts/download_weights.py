@@ -47,7 +47,7 @@ def parse_args():
     parser.add_argument(
         "--model_type",
         type=str,
-        choices=["sd15", "sdxl"],
+        choices=["sd15", "sdxl", "pixart_sigma", "sana"],
         default="sdxl",
         help="模型类型（仅 --repo_id 模式下需要指定，默认 sdxl）",
     )

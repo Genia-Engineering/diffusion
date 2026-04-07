@@ -474,3 +474,90 @@ class PixArtSigmaCachedLatentDataset(BaseImageDataset):
         if padding_mask is not None:
             result["padding_mask"] = padding_mask
         return result
+
+
+class SanaCachedLatentDataset(BaseImageDataset):
+    """Sana 0.6B 使用预缓存 VAE latent 的数据集。
+
+    与 PixArtSigmaCachedLatentDataset 结构相同（单文本编码器 + attention mask），
+    但使用 Gemma2 tokenizer（max_length=300）和 AutoencoderDC 的 32 通道 latent。
+
+    支持两种文本模式:
+      1. 固定 caption (text_embed_cache_dir=None): 所有图像共用同一份 tokenized ids
+      2. 逐图预编码 (text_embed_cache_dir 指定): 每张图像从磁盘加载预编码嵌入
+    """
+
+    MAX_SEQ_LENGTH = 300
+
+    def __init__(
+        self,
+        data_dir: str,
+        cache_dir: str,
+        tokenizer=None,
+        resolution: int = 1024,
+        random_flip: bool = True,
+        fixed_caption: str = "",
+        max_train_samples: int | None = None,
+        text_embed_cache_dir: str | None = None,
+    ):
+        super().__init__(data_dir, resolution, center_crop=False, random_flip=False, max_train_samples=max_train_samples)
+        self.cache_dir = Path(cache_dir)
+        self.do_random_flip = random_flip
+        self.text_embed_cache_dir = Path(text_embed_cache_dir) if text_embed_cache_dir else None
+
+        if self.text_embed_cache_dir is None:
+            tokenized = tokenizer(
+                fixed_caption,
+                padding="max_length",
+                truncation=True,
+                max_length=self.MAX_SEQ_LENGTH,
+                return_tensors="pt",
+            )
+            self.cached_input_ids = tokenized.input_ids.squeeze(0)
+            self.cached_attention_mask = tokenized.attention_mask.squeeze(0)
+
+    def get_image_sizes(self) -> list[tuple[int, int]]:
+        sizes = []
+        for p in self.image_paths:
+            data = torch.load(self.cache_dir / f"{p.stem}.pt", map_location="cpu", weights_only=True)
+            target_h, target_w = data["target_hw"].tolist()
+            sizes.append((target_w, target_h))
+        return sizes
+
+    def __getitem__(self, idx: int) -> dict:
+        cache_file = self.cache_dir / f"{self.image_paths[idx].stem}.pt"
+        data = torch.load(cache_file, map_location="cpu", weights_only=False)
+
+        use_flip = self.do_random_flip and random.random() < 0.5
+        latents = data["latent_flip"] if use_flip else data["latent"]
+
+        weight_mask = data.get("weight_mask", None)
+        if weight_mask is not None:
+            weight_mask = torch.flip(weight_mask, dims=[-1]) if use_flip else weight_mask
+            weight_mask = weight_mask.float()
+
+        padding_mask = data.get("padding_mask", None)
+        if padding_mask is not None:
+            padding_mask = torch.flip(padding_mask, dims=[-1]) if use_flip else padding_mask
+            padding_mask = padding_mask.float()
+
+        if self.text_embed_cache_dir is not None:
+            text_file = self.text_embed_cache_dir / f"{self.image_paths[idx].stem}.pt"
+            text_data = torch.load(text_file, map_location="cpu", weights_only=True)
+            result = {
+                "latents": latents.float(),
+                "prompt_embeds": text_data["prompt_embeds"].squeeze(0).float(),
+                "prompt_attention_mask": text_data["prompt_attention_mask"].squeeze(0),
+            }
+        else:
+            result = {
+                "latents": latents.float(),
+                "input_ids": self.cached_input_ids,
+                "attention_mask": self.cached_attention_mask,
+            }
+
+        if weight_mask is not None:
+            result["weight_mask"] = weight_mask
+        if padding_mask is not None:
+            result["padding_mask"] = padding_mask
+        return result

@@ -1,0 +1,118 @@
+# ============================================================
+# PixArt-Sigma ControlNet-XS 双学习率配置 — 建筑平面图
+# 硬件: 1× NVIDIA A10G (23GB)
+# 数据集: ~3400 张 1024×1024 PNG
+#
+# 架构: PixArt-Sigma DiT + ControlNet-XS Adapter
+#   - XS Adapter: 14 个薄型 block (control_dim=288, 无 cross-attention)
+#   - 双向投射: base(1152) ↔ control(288), control→base 零初始化
+#   - CNN 编码器: 条件图在线通过轻量 CNN 编码（无需 VAE 预缓存）
+#
+# ── 训练模式: 分组学习率全参微调 ──────────
+#
+#  Transformer (主干网络):  lr = 5e-5  (预训练权重，较保守的更新)
+#  XS Adapter (控制分支):   lr = 2e-4  (新增模块，快速收敛)
+#
+#  参数量: ~611M (Transformer) + ~24M (XS Adapter) = ~635M 全部可训练
+#  显存: ~11GB (bf16, gc=ON, batch=4)
+#
+# 训练范式: DDPM (epsilon prediction)
+#   - 分桶关闭: 所有图片等比缩放 + 居中 padding 到 1024×1024
+#   - 控制图与原图保持一致的 padding 处理
+#
+# 启动方式:
+#   bash train.sh pixart_cnxs_duallr           # 标准训练
+#   bash train.sh pixart_cnxs_duallr resume    # 恢复训练
+# ============================================================
+
+model:
+  pretrained_model_name_or_path: "PixArt-alpha/PixArt-Sigma-XL-2-1024-MS"
+  model_type: "pixart_sigma"
+  weights_dir: "/home/daiqing_tan/stable_diffusion_lora/weights"
+  # 微调后的 Transformer 权重路径（可选）
+  # 设置后将覆盖 pretrained 权重，用领域适配后的 Transformer 初始化
+  finetuned_transformer_path: "./outputs/pixart_sigma_floorplan/checkpoints/step_003600/transformer"
+
+controlnet:
+  conditioning_mode: "cnn_encoder"
+  conditioning_type: "precomputed"
+
+  # 全参微调: Transformer + XS Adapter 均可训练
+  train_transformer: true
+
+  # XS Adapter 独立学习率 — 与 training.learning_rate 分开
+  # Transformer 使用 training.learning_rate (5e-5)
+  # XS Adapter 使用此 controlnet_lr (2e-4)
+  controlnet_lr: 2.0e-4
+
+controlnet_xs:
+  num_layers: 14                        # XS block 数量
+  size_ratio: 0.25                      # control_dim = 1152 * 0.25 = 288
+  connection_interval: 2                # 每 2 个 base block 一次双向交换
+
+training:
+  output_dir: "./outputs/controlnet_xs_pixart_sigma_dual_lr"
+  num_train_steps: 3600                 # ~60 epoch
+  # 主干网络学习率 — 预训练权重使用较小 lr 防止灾难性遗忘
+  learning_rate: 5.0e-5
+  train_batch_size: 2
+  gradient_accumulation_steps: 8        # effective batch = 2×1GPU×4accum = 8
+  mixed_precision: "bf16"
+  cache_latents: true
+  cache_text_embeddings: true
+  latent_cache_batch_size: 4
+
+  validation_steps: 300
+  save_steps: 300
+  keep_last_n_checkpoints: 12
+
+  save_best: true
+  best_loss_ema_decay: 0.99
+  lr_warmup_steps: 150                  # 前 ~10% 总步数 warmup
+  gradient_checkpointing: true
+  attention_backend: "sdpa"
+  allow_tf32: true
+  dataloader_num_workers: 8
+
+  # 噪声范式: DDPM (epsilon prediction)
+  noise_paradigm: "ddpm"
+  prediction_type: "epsilon"
+  loss_type: "mse"
+  noise_offset: 0.05
+  min_snr_gamma: 5.0
+  caption_dropout_rate: 0.1
+
+data:
+  train_data_dir: "/home/daiqing_tan/stable_diffusion_lora/data/data/size_1024/floor"
+  conditioning_data_dir: "/home/daiqing_tan/stable_diffusion_lora/data/data/size_1024_controlnet/floor"
+  resolution: 1024
+
+  use_aspect_ratio_bucketing: false
+  pad_color: [0, 0, 0]                 # padding 填充色 (RGB 0-255)
+
+  center_crop: false
+  random_flip: true
+  t5_max_length: 300
+
+  caption_mode: "fixed"
+  caption: "architectural floor plan, blueprint, technical drawing"
+
+  caption_dir: "/home/daiqing_tan/stable_diffusion_lora/data/data/description"
+  caption_stem_replace:
+    from: "___total__1024"
+    to: "_controlnet_color_1024"
+  caption_fallback: "architectural floor plan, blueprint, technical drawing"
+
+validation:
+  num_val_samples: 4
+
+  prompt_source: "config"
+
+  prompts:
+    - "architectural floor plan, blueprint, technical drawing"
+
+  negative_prompt: ""
+  num_inference_steps: 20
+  guidance_scale: 4.5
+  seed: 42
+  num_images_per_prompt: 1

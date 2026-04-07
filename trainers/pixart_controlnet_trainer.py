@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 from omegaconf import DictConfig
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -55,6 +56,8 @@ class PixArtControlNetTrainer(BaseTrainer):
         self.noise_offset: float = float(self.training_cfg.get("noise_offset", 0.0))
         self.min_snr_gamma: float = float(self.training_cfg.get("min_snr_gamma", 0.0))
         self.conditioning_mode: str = str(self.cn_cfg.get("conditioning_mode", "vae"))
+        self.train_transformer: bool = bool(self.cn_cfg.get("train_transformer", False))
+        self.caption_dropout_rate: float = float(self.training_cfg.get("caption_dropout_rate", 0.0))
 
         self._load_models()
         self._create_controlnet()
@@ -86,14 +89,37 @@ class PixArtControlNetTrainer(BaseTrainer):
         self.tokenizer = components["tokenizer"]
         self.noise_scheduler = components["noise_scheduler"]
 
+        ft_path = self.config.model.get("finetuned_transformer_path", None)
+        if ft_path and os.path.isdir(ft_path):
+            from diffusers import PixArtTransformer2DModel
+            self.transformer = PixArtTransformer2DModel.from_pretrained(
+                ft_path, torch_dtype=self.transformer.dtype,
+            )
+            logger.info(f"Fine-tuned transformer loaded from: {ft_path}")
+        else:
+            logger.info("Using original pretrained transformer (no finetuned_transformer_path set)")
+
     def _create_controlnet(self):
         num_layers = int(self.cn_cfg.get("num_layers", 13))
+        init_from_transformer = bool(self.cn_cfg.get("init_from_transformer", True))
 
-        self.controlnet = PixArtControlNetAdapterModel.from_transformer(
-            self.transformer,
-            num_layers=num_layers,
-            conditioning_mode=self.conditioning_mode,
-        )
+        if init_from_transformer:
+            self.controlnet = PixArtControlNetAdapterModel.from_transformer(
+                self.transformer,
+                num_layers=num_layers,
+                conditioning_mode=self.conditioning_mode,
+            )
+        else:
+            self.controlnet = PixArtControlNetAdapterModel(
+                num_layers=num_layers,
+                conditioning_mode=self.conditioning_mode,
+            )
+            n_params = sum(p.numel() for p in self.controlnet.parameters())
+            logger.info(
+                f"PixArt ControlNet adapter randomly initialized: "
+                f"{num_layers} blocks, mode={self.conditioning_mode}, "
+                f"params={n_params:,}"
+            )
 
         self.joint_model = PixArtControlNetTransformerModel(
             transformer=self.transformer,
@@ -103,14 +129,22 @@ class PixArtControlNetTrainer(BaseTrainer):
     def _freeze_parameters(self):
         self.vae.requires_grad_(False)
         self.text_encoder.requires_grad_(False)
-        self.transformer.requires_grad_(False)
-        self.controlnet.requires_grad_(True)
-        self.print_trainable_params(self.controlnet)
+        if self.train_transformer:
+            self.transformer.requires_grad_(True)
+            self.controlnet.requires_grad_(True)
+            logger.info("全参微调模式: Transformer + ControlNet 均可训练")
+            self.print_trainable_params(self.transformer, self.controlnet)
+        else:
+            self.transformer.requires_grad_(False)
+            self.controlnet.requires_grad_(True)
+            self.print_trainable_params(self.controlnet)
 
     def _build_dataloader(self) -> DataLoader:
         data_cfg = self.config.data
         batch_size = self.training_cfg.get("train_batch_size", 2)
         fixed_caption = data_cfg.get("caption", "")
+        use_bucketing = data_cfg.get("use_aspect_ratio_bucketing", True)
+        pad_color = tuple(data_cfg.get("pad_color", [0, 0, 0]))
 
         cache_dir = self._get_latent_cache_dir()
         conditioning_latent_cache_dir = self._get_conditioning_latent_cache_dir()
@@ -136,23 +170,41 @@ class PixArtControlNetTrainer(BaseTrainer):
             t5_max_length=int(data_cfg.get("t5_max_length", 300)),
             max_train_samples=data_cfg.get("max_train_samples", None),
             text_embed_cache_dir=text_embed_cache_dir,
+            use_bucketing=use_bucketing,
+            pad_color=pad_color,
         )
 
-        bucket_manager = BucketManager(model_type=self.model_type)
-        image_sizes = dataset.get_image_sizes()
-        bucket_to_indices = bucket_manager.assign_buckets(image_sizes)
-        dataset.set_bucket_assignments(bucket_to_indices)
-        self._log_bucket_stats(bucket_to_indices)
-        sampler = BucketSampler(bucket_to_indices, batch_size, drop_last=True, shuffle=True)
-        dataloader = DataLoader(
-            dataset,
-            batch_size=batch_size,
-            sampler=sampler,
-            num_workers=self.training_cfg.get("dataloader_num_workers", 4),
-            pin_memory=True,
-            drop_last=True,
-            collate_fn=_safe_collate,
-        )
+        if use_bucketing:
+            bucket_manager = BucketManager(model_type=self.model_type)
+            image_sizes = dataset.get_image_sizes()
+            bucket_to_indices = bucket_manager.assign_buckets(image_sizes)
+            dataset.set_bucket_assignments(bucket_to_indices)
+            self._log_bucket_stats(bucket_to_indices)
+            sampler = BucketSampler(bucket_to_indices, batch_size, drop_last=True, shuffle=True)
+            dataloader = DataLoader(
+                dataset,
+                batch_size=batch_size,
+                sampler=sampler,
+                num_workers=self.training_cfg.get("dataloader_num_workers", 4),
+                pin_memory=True,
+                drop_last=True,
+                collate_fn=_safe_collate,
+            )
+        else:
+            resolution = data_cfg.get("resolution", 1024)
+            logger.info(
+                f"分桶已关闭，所有图片 pad 至 {resolution}×{resolution}，"
+                f"控制图同步 pad，使用标准 shuffle DataLoader"
+            )
+            dataloader = DataLoader(
+                dataset,
+                batch_size=batch_size,
+                shuffle=True,
+                num_workers=self.training_cfg.get("dataloader_num_workers", 4),
+                pin_memory=True,
+                drop_last=True,
+                collate_fn=_safe_collate,
+            )
 
         return dataloader
 
@@ -181,6 +233,7 @@ class PixArtControlNetTrainer(BaseTrainer):
 
         与 _precompute_latents 保持一致：每张条件图按其对应目标图的 bucket 尺寸
         resize 后送入 VAE，相同尺寸的图片打包为 batch 批量 encode。
+        非分桶模式下使用 AspectRatioPad 确保条件图与目标图保持一致的 padding。
         """
         import torchvision.transforms as T
         import torchvision.transforms.functional as TF
@@ -190,7 +243,7 @@ class PixArtControlNetTrainer(BaseTrainer):
         from data.buckets import BucketManager
         from data.controlnet_dataset import _build_cond_index, _strip_known_suffix, _KNOWN_SUFFIX_PAIRS
         from data.dataset import BaseImageDataset
-        from data.transforms import AspectRatioResize
+        from data.transforms import AspectRatioPad, AspectRatioResize
 
         cache_dir_path = Path(cache_dir)
         cache_dir_path.mkdir(parents=True, exist_ok=True)
@@ -198,6 +251,8 @@ class PixArtControlNetTrainer(BaseTrainer):
         data_cfg = self.config.data
         center_crop = data_cfg.get("center_crop", False)
         vae_batch_size = self.training_cfg.get("latent_cache_batch_size", 4)
+        use_bucketing = data_cfg.get("use_aspect_ratio_bucketing", True)
+        pad_color = tuple(data_cfg.get("pad_color", [0, 0, 0]))
 
         num_processes = self.accelerator.num_processes
         process_index = self.accelerator.process_index
@@ -226,7 +281,7 @@ class PixArtControlNetTrainer(BaseTrainer):
             center_crop=center_crop,
             random_flip=False,
         )
-        if data_cfg.get("use_aspect_ratio_bucketing", True):
+        if use_bucketing:
             bucket_manager = BucketManager(model_type=self.model_type)
             image_sizes = temp_dataset.get_image_sizes()
             bucket_to_indices = bucket_manager.assign_buckets(image_sizes)
@@ -280,7 +335,10 @@ class PixArtControlNetTrainer(BaseTrainer):
                 disable=not self.accelerator.is_main_process,
             ) as pbar:
                 for target_size, indices in size_groups.items():
-                    resizer = AspectRatioResize(target_size, center_crop=center_crop)
+                    if use_bucketing:
+                        resizer = AspectRatioResize(target_size, center_crop=center_crop)
+                    else:
+                        padder = AspectRatioPad(target_size, pad_color=pad_color)
 
                     for batch_start in range(0, len(indices), vae_batch_size):
                         batch_indices = indices[batch_start: batch_start + vae_batch_size]
@@ -288,7 +346,10 @@ class PixArtControlNetTrainer(BaseTrainer):
                         imgs_normal, imgs_flip = [], []
                         for ci in batch_indices:
                             cond_img = PIL_Image.open(cond_paths[ci]).convert("RGB")
-                            cond_img = resizer(cond_img)
+                            if use_bucketing:
+                                cond_img = resizer(cond_img)
+                            else:
+                                cond_img, _ = padder(cond_img)
                             imgs_normal.append(normalize(to_tensor(cond_img)))
                             imgs_flip.append(normalize(to_tensor(TF.hflip(cond_img))))
 
@@ -333,6 +394,21 @@ class PixArtControlNetTrainer(BaseTrainer):
 
     # ── 训练主循环 ───────────────────────────────────────────────────────
 
+    @torch.no_grad()
+    def _encode_null_prompt(self):
+        """预编码空提示词（用于 caption dropout），在 text_encoder 卸载前调用。"""
+        device = self.text_encoder.device
+        t5_max_len = 300
+        tokenized = self.tokenizer(
+            "", padding="max_length", truncation=True,
+            max_length=t5_max_len, return_tensors="pt",
+        )
+        ids = tokenized.input_ids.to(device)
+        attn_mask = tokenized.attention_mask.to(device)
+        self._cached_negative_prompt_embeds = self.text_encoder(ids, attention_mask=attn_mask)[0].cpu()
+        self._cached_negative_prompt_attention_mask = attn_mask.cpu()
+        logger.info(f"Null prompt encoded for caption dropout (rate={self.caption_dropout_rate})")
+
     def train(self):
         """PixArt-Sigma ControlNet 主训练循环。"""
         self.vae.to(self.accelerator.device, dtype=torch.float32)
@@ -348,8 +424,12 @@ class PixArtControlNetTrainer(BaseTrainer):
         self._precompute_latents_distributed(self._get_latent_cache_dir())
 
         # 阶段3: T5 文本嵌入预计算
-        # 先卸载 VAE 释放显存 — latent 预计算已完成，VAE 直到验证阶段才需要
-        self.vae.to("cpu")
+        # 辅助 loss 需要 VAE decoder 在 GPU 上（梯度穿过 decoder 回传到模型），
+        # 仅删除 encoder 释放显存；否则整个 VAE 卸载到 CPU。
+        if getattr(self, "_aux_enabled", False):
+            self._delete_vae_encoder()
+        else:
+            self.vae.to("cpu")
         torch.cuda.empty_cache()
 
         cache_text_embeddings = self.training_cfg.get("cache_text_embeddings", True)
@@ -363,7 +443,6 @@ class PixArtControlNetTrainer(BaseTrainer):
             if self._per_image_caption:
                 text_embed_cache_dir = self._get_text_embed_per_image_cache_dir()
                 need_encode = not self._per_image_text_embed_cache_exists(text_embed_cache_dir)
-                # 验证嵌入缓存也可能需要重新编码（如从 fixed 切换到 per_image 模式）
                 val_cache_file = Path(text_embed_cache_dir) / "__val_and_neg_prompts__.pt"
                 need_val_encode = not val_cache_file.exists()
                 if val_cache_file.exists():
@@ -373,12 +452,20 @@ class PixArtControlNetTrainer(BaseTrainer):
                     del _tmp
                 if need_encode or need_val_encode:
                     self.text_encoder.to(self.accelerator.device)
+                if self.caption_dropout_rate > 0 and not hasattr(self, "_cached_negative_prompt_embeds"):
+                    if self.text_encoder is not None and next(self.text_encoder.parameters()).device == torch.device("cpu"):
+                        self.text_encoder.to(self.accelerator.device)
+                    self._encode_null_prompt()
                 self._precompute_per_image_text_embeddings(text_embed_cache_dir)
             else:
                 self.text_encoder.to(self.accelerator.device)
+                if self.caption_dropout_rate > 0 and not hasattr(self, "_cached_negative_prompt_embeds"):
+                    self._encode_null_prompt()
                 self._precompute_text_embeddings()
         else:
             self.text_encoder.to(self.accelerator.device)
+            if self.caption_dropout_rate > 0 and not hasattr(self, "_cached_negative_prompt_embeds"):
+                self._encode_null_prompt()
 
         # 阶段4: 准备训练组件
         dataloader = self._build_dataloader()
@@ -387,8 +474,28 @@ class PixArtControlNetTrainer(BaseTrainer):
         validation_steps = self.training_cfg.get("validation_steps", 500)
         save_steps = self.training_cfg.get("save_steps", 500)
 
-        trainable_params = [p for p in self.controlnet.parameters() if p.requires_grad]
-        optimizer = self.setup_optimizer(trainable_params=trainable_params)
+        controlnet_lr = float(self.cn_cfg.get("controlnet_lr", 0))
+        base_lr = float(self.training_cfg.learning_rate)
+
+        if self.train_transformer:
+            transformer_params = [p for p in self.transformer.parameters() if p.requires_grad]
+            cn_params = [p for p in self.controlnet.parameters() if p.requires_grad]
+            trainable_params = transformer_params + cn_params
+
+            if controlnet_lr > 0:
+                param_groups = [
+                    {"params": transformer_params, "lr": base_lr},
+                    {"params": cn_params, "lr": controlnet_lr},
+                ]
+                optimizer = self.setup_optimizer(param_groups=param_groups)
+                logger.info(
+                    f"分组学习率: Transformer lr={base_lr:.2e}, ControlNet lr={controlnet_lr:.2e}"
+                )
+            else:
+                optimizer = self.setup_optimizer(trainable_params=trainable_params)
+        else:
+            trainable_params = [p for p in self.controlnet.parameters() if p.requires_grad]
+            optimizer = self.setup_optimizer(trainable_params=trainable_params)
         lr_scheduler = self.setup_lr_scheduler(optimizer, num_train_steps)
 
         self.joint_model, optimizer, dataloader = self.accelerator.prepare(
@@ -408,13 +515,13 @@ class PixArtControlNetTrainer(BaseTrainer):
         if resume_dir == "latest":
             resume_dir = self.ckpt_manager.get_latest_checkpoint()
         if resume_dir:
-            state = self.ckpt_manager.load(
-                resume_dir,
-                controlnet=self.controlnet,
-                optimizer=optimizer,
-                lr_scheduler=lr_scheduler,
-                is_lora=False,
-            )
+            load_kwargs = {"optimizer": optimizer, "lr_scheduler": lr_scheduler, "is_lora": False}
+            if self.train_transformer:
+                load_kwargs["transformer"] = self.accelerator.unwrap_model(self.joint_model).transformer
+                load_kwargs["controlnet"] = self.controlnet
+            else:
+                load_kwargs["controlnet"] = self.controlnet
+            state = self.ckpt_manager.load(resume_dir, **load_kwargs)
             self.global_step = state["step"]
             self.global_epoch = state["epoch"]
             if save_best and "ema_loss" in state:
@@ -437,6 +544,11 @@ class PixArtControlNetTrainer(BaseTrainer):
                 val_prompts = [self.config.data.get("caption", "a test image")]
         else:
             val_prompts = list(val_cfg.get("prompts", ["a test image"]))
+
+        num_val_samples = val_cfg.get("num_val_samples", None)
+        if num_val_samples is not None and len(val_prompts) < num_val_samples:
+            val_prompts = (val_prompts * ((num_val_samples // len(val_prompts)) + 1))[:num_val_samples]
+
         val_loop = ValidationLoop(
             prompts=val_prompts,
             negative_prompt=val_cfg.get("negative_prompt", ""),
@@ -459,9 +571,9 @@ class PixArtControlNetTrainer(BaseTrainer):
         )
 
         self.joint_model.train()
-        # 确保 transformer 子模块冻结时处于 eval 模式
-        unwrapped = self.accelerator.unwrap_model(self.joint_model)
-        unwrapped.transformer.eval()
+        if not self.train_transformer:
+            unwrapped = self.accelerator.unwrap_model(self.joint_model)
+            unwrapped.transformer.eval()
 
         for epoch in range(num_epochs):
             self.global_epoch = epoch
@@ -486,6 +598,23 @@ class PixArtControlNetTrainer(BaseTrainer):
                     step_loss = loss.item()
                     current_lr = lr_scheduler.get_last_lr()[0]
                     self.log_step(step_loss, current_lr, grad_norm)
+
+                    if getattr(self, "_aux_enabled", False):
+                        _last_diff = getattr(self, "_last_diffusion_loss", None)
+                        _last_aux = getattr(self, "_last_aux_loss", None)
+                        if _last_diff is not None:
+                            self.tb_logger.log_scalar(
+                                "train/diffusion_loss", _last_diff, self.global_step,
+                            )
+                        if _last_aux is not None:
+                            aux_w = self._aux_weight * _last_aux
+                            self.tb_logger.log_scalar(
+                                "train/aux_loss_weighted", aux_w, self.global_step,
+                            )
+                            if _last_diff and _last_diff > 0:
+                                self.tb_logger.log_scalar(
+                                    "train/aux_div_diffusion", aux_w / _last_diff, self.global_step,
+                                )
 
                     progress_bar.update(1)
                     progress_bar.set_postfix(loss=f"{step_loss:.4f}", lr=f"{current_lr:.2e}")
@@ -553,6 +682,17 @@ class PixArtControlNetTrainer(BaseTrainer):
                 prompt_embeds = self.text_encoder(input_ids, attention_mask=attn_mask)[0]
             attention_mask = attn_mask
 
+        # caption dropout: 随机将部分样本的文本条件替换为空提示词
+        if self.caption_dropout_rate > 0 and hasattr(self, "_cached_negative_prompt_embeds"):
+            drop_mask = torch.rand(bsz, device=latents.device) < self.caption_dropout_rate
+            if drop_mask.any():
+                null_embeds = self._cached_negative_prompt_embeds.to(latents.device)
+                null_mask = self._cached_negative_prompt_attention_mask.to(latents.device)
+                prompt_embeds = prompt_embeds.clone()
+                attention_mask = attention_mask.clone()
+                prompt_embeds[drop_mask] = null_embeds.expand(drop_mask.sum(), -1, -1)
+                attention_mask[drop_mask] = null_mask.expand(drop_mask.sum(), -1)
+
         # 条件输入
         if "conditioning_latents" in batch:
             controlnet_cond = batch["conditioning_latents"].to(self.accelerator.device)
@@ -569,7 +709,6 @@ class PixArtControlNetTrainer(BaseTrainer):
             controlnet_cond=controlnet_cond,
         ).sample
 
-        # learned variance: 只取前半部分
         if noise_pred.shape[1] != latents.shape[1]:
             noise_pred, _ = noise_pred.chunk(2, dim=1)
 
@@ -577,6 +716,25 @@ class PixArtControlNetTrainer(BaseTrainer):
             target = self.noise_scheduler.get_velocity(latents, noise, timesteps)
         else:
             target = noise
+
+        # padding_mask: 非分桶模式下，padding 区域不计算 loss
+        padding_mask = batch.get("padding_mask", None)
+        if padding_mask is not None:
+            padding_mask = padding_mask.to(latents.device)
+            per_pixel = F.mse_loss(noise_pred.float(), target.float(), reduction="none")
+
+            # Min-SNR 加权
+            if self.min_snr_gamma > 0 and self._snr_cache is not None:
+                snr = self._snr_cache.to(timesteps.device)[timesteps]
+                if self.noise_scheduler.config.prediction_type == "v_prediction":
+                    weights = torch.clamp(snr, max=self.min_snr_gamma) / (snr + 1.0)
+                else:
+                    weights = torch.clamp(snr, max=self.min_snr_gamma) / snr
+                per_sample = (per_pixel * padding_mask).sum(dim=[1, 2, 3]) / padding_mask.sum(dim=[1, 2, 3]).clamp(min=1) / per_pixel.shape[1]
+                return (per_sample * weights).mean()
+
+            n_content = padding_mask.sum() * per_pixel.shape[1]
+            return (per_pixel * padding_mask).sum() / n_content.clamp(min=1)
 
         loss = self.compute_loss(
             noise_pred, target, timesteps,
@@ -663,9 +821,12 @@ class PixArtControlNetTrainer(BaseTrainer):
         except Exception:
             logger.exception(f"Validation failed at step {self.global_step}, skipping")
         finally:
-            self.vae.to("cpu")
-            torch.cuda.empty_cache()
+            if not getattr(self, "_aux_enabled", False):
+                self.vae.to("cpu")
+                torch.cuda.empty_cache()
             unwrapped.controlnet.train()
+            if self.train_transformer:
+                unwrapped.transformer.train()
 
     def _load_captions_for_stems(self, stems: list[str]) -> list[str]:
         """根据训练图 stem 列表加载对应的 caption 文本。"""
@@ -833,28 +994,38 @@ class PixArtControlNetTrainer(BaseTrainer):
         if not self.accelerator.is_main_process:
             return
 
-        self.ckpt_manager.save(
-            step=self.global_step,
-            global_epoch=self.global_epoch,
-            controlnet=self.controlnet,
-            optimizer=optimizer,
-            lr_scheduler=lr_scheduler,
-            seed=self.training_cfg.get("seed", 42),
-            is_lora=False,
-            ema_loss=self._ema_loss,
-        )
+        save_kwargs = {
+            "step": self.global_step,
+            "global_epoch": self.global_epoch,
+            "controlnet": self.controlnet,
+            "optimizer": optimizer,
+            "lr_scheduler": lr_scheduler,
+            "seed": self.training_cfg.get("seed", 42),
+            "is_lora": False,
+            "ema_loss": self._ema_loss,
+        }
+        if self.train_transformer:
+            save_kwargs["transformer"] = self.accelerator.unwrap_model(self.joint_model).transformer
+            save_kwargs["accelerator"] = self.accelerator
+
+        self.ckpt_manager.save(**save_kwargs)
 
     def _save_best_checkpoint(self, optimizer, lr_scheduler, best_loss: float):
         if not self.accelerator.is_main_process:
             return
 
-        self.ckpt_manager.save_best(
-            step=self.global_step,
-            global_epoch=self.global_epoch,
-            best_metric_value=best_loss,
-            controlnet=self.controlnet,
-            optimizer=optimizer,
-            lr_scheduler=lr_scheduler,
-            seed=self.training_cfg.get("seed", 42),
-            is_lora=False,
-        )
+        save_kwargs = {
+            "step": self.global_step,
+            "global_epoch": self.global_epoch,
+            "best_metric_value": best_loss,
+            "controlnet": self.controlnet,
+            "optimizer": optimizer,
+            "lr_scheduler": lr_scheduler,
+            "seed": self.training_cfg.get("seed", 42),
+            "is_lora": False,
+        }
+        if self.train_transformer:
+            save_kwargs["transformer"] = self.accelerator.unwrap_model(self.joint_model).transformer
+            save_kwargs["accelerator"] = self.accelerator
+
+        self.ckpt_manager.save_best(**save_kwargs)

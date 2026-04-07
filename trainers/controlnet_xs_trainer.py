@@ -6,16 +6,24 @@
      （标准 ControlNet 需要两次前向：controlnet → unet）
   3. 冻结策略：unet_xs.freeze_unet_params() 一次性冻结 base UNet 参数
   4. 推理管线：StableDiffusionXLControlNetXSPipeline
+
+训练模式（通过 controlnet.train_unet 切换）:
+  train_unet=False: 仅训练 XS Adapter（冻结 base UNet）
+  train_unet=True:  全参微调（base UNet + XS Adapter 同时训练）
+                    支持 pretrained_controlnet_path 加载预训练 adapter 权重
+                    支持 controlnet_lr 分组学习率
 """
 
 import gc
 import logging
 import math
 import os
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 from diffusers import UNet2DConditionModel
+from diffusers.models.controlnets.controlnet_xs import ControlNetXSAdapter
 from omegaconf import DictConfig
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -41,8 +49,11 @@ class ControlNetXSTrainer(ControlNetTrainer):
         # unet_xs: UNetControlNetXSModel（用于训练前向传播）
         self.adapter = None
         self.unet_xs = None
+        self.train_unet: bool = bool(config.controlnet.get("train_unet", False))
+        self.caption_dropout_rate: float = float(config.training.get("caption_dropout_rate", 0.0))
         super().__init__(config)
 
+        self._load_pretrained_adapter()
         self._init_auxiliary_loss(config)
 
         # unet_xs 也需要梯度检查点和注意力后端优化
@@ -94,6 +105,16 @@ class ControlNetXSTrainer(ControlNetTrainer):
                 unet=source_unet, dtype=weight_dtype,
             )
 
+        # unet_xs 是可训练模型，必须用 fp32 作为 master weights。
+        # bf16/fp16 精度不足以累积小梯度更新（update < ULP 会被舍入为零），
+        # Accelerate 的 autocast 会在前向传播时自动将 fp32 权重临时转为 bf16 计算。
+        if weight_dtype != torch.float32:
+            self.unet_xs = self.unet_xs.float()
+            logger.info(
+                f"unet_xs 已从 {weight_dtype} 提升到 fp32 (master weights)，"
+                f"前向传播通过 autocast 仍使用 {weight_dtype}"
+            )
+
         # 可选：移除 ctrl 分支的 cross-attention（与 PixArt XS 一致）
         if xs_cfg.get("no_ctrl_cross_attention", False):
             removed = strip_ctrl_cross_attention(self.unet_xs)
@@ -113,26 +134,143 @@ class ControlNetXSTrainer(ControlNetTrainer):
         else:
             logger.info(f"ControlNet-XS initialized from {model_path}")
 
+    # ── adapter ↔ unet_xs 参数同步 ────────────────────────────────────────
+    #
+    # diffusers UNetControlNetXSModel.from_unet() 通过 load_state_dict() 复制权重，
+    # 导致 self.adapter 与 self.unet_xs 中的 ctrl_* 参数完全独立（不共享引用）。
+    # 因此需要显式同步：
+    #   adapter → unet_xs: 加载预训练 adapter 权重时
+    #   unet_xs → adapter: 保存 checkpoint 时（确保 adapter 包含最新训练权重）
+
+    @staticmethod
+    def _map_adapter_key_to_unet_xs(key: str) -> str:
+        """将 adapter state_dict key 映射到 unet_xs state_dict key。"""
+        if key.startswith("conv_in."):
+            return "ctrl_" + key
+        if key.startswith("time_embedding."):
+            return "ctrl_" + key
+        if ".resnets." in key and key.startswith("down_blocks."):
+            parts = key.split(".", 2)  # ['down_blocks', '{i}', 'resnets.{j}...']
+            return f"down_blocks.{parts[1]}.ctrl_{parts[2]}"
+        if ".attentions." in key and key.startswith("down_blocks."):
+            parts = key.split(".", 2)
+            return f"down_blocks.{parts[1]}.ctrl_{parts[2]}"
+        if ".downsamplers." in key and key.startswith("down_blocks."):
+            parts = key.split(".", 2)
+            return f"down_blocks.{parts[1]}.ctrl_{parts[2]}"
+        if key.startswith("mid_block.midblock."):
+            return key.replace("mid_block.midblock.", "mid_block.ctrl_midblock.")
+        if key.startswith("up_connections."):
+            return key.replace("up_connections.", "up_blocks.")
+        return key
+
+    def _sync_adapter_to_unet_xs(self, adapter_state_dict: dict[str, torch.Tensor]) -> int:
+        """将 adapter 权重同步到 unet_xs 的对应 ctrl_* 参数中。
+
+        注意: accelerator.prepare() 后 unet_xs 可能被 DDP 包装，
+        需要 unwrap 才能获得正确的 named_parameters key（无 module. 前缀）。
+
+        Returns:
+            成功同步的参数数量。
+        """
+        unwrapped = self.accelerator.unwrap_model(self.unet_xs)
+        xs_params = dict(unwrapped.named_parameters())
+        xs_buffers = dict(unwrapped.named_buffers())
+        synced = 0
+        for adapter_key, value in adapter_state_dict.items():
+            xs_key = self._map_adapter_key_to_unet_xs(adapter_key)
+            if xs_key in xs_params:
+                xs_params[xs_key].data.copy_(value)
+                synced += 1
+            elif xs_key in xs_buffers:
+                xs_buffers[xs_key].copy_(value)
+                synced += 1
+            else:
+                logger.warning(f"Adapter key '{adapter_key}' → '{xs_key}' not found in unet_xs")
+        return synced
+
+    def _sync_unet_xs_to_adapter(self) -> dict[str, torch.Tensor]:
+        """将 unet_xs 中训练后的 ctrl_* 参数回写到 adapter（用于保存 checkpoint）。
+
+        Returns:
+            unet_xs 的完整 state_dict（复用于后续 unet_xs.pt 保存，避免重复创建）。
+        """
+        unet_xs_model = self.accelerator.unwrap_model(self.unet_xs)
+        xs_sd = unet_xs_model.state_dict()
+        adapter_sd = self.adapter.state_dict()
+        for adapter_key in adapter_sd:
+            xs_key = self._map_adapter_key_to_unet_xs(adapter_key)
+            if xs_key in xs_sd:
+                adapter_sd[adapter_key] = xs_sd[xs_key]
+        self.adapter.load_state_dict(adapter_sd)
+        return xs_sd
+
+    def _load_pretrained_adapter(self):
+        """加载预训练 ControlNet-XS adapter 权重到 unet_xs（可选）。
+
+        支持两种路径格式:
+          - checkpoint 目录（含 controlnet/ 子目录）
+          - 直接指向 controlnet/ 目录
+
+        注意: adapter 与 unet_xs 参数不共享，需通过 key 映射同步到 unet_xs。
+        """
+        path = self.cn_cfg.get("pretrained_controlnet_path", None)
+        if not path:
+            return
+
+        cn_dir = Path(path)
+        if (cn_dir / "controlnet").is_dir():
+            cn_dir = cn_dir / "controlnet"
+
+        if not cn_dir.exists():
+            raise FileNotFoundError(f"Pretrained ControlNet-XS path not found: {cn_dir}")
+
+        loaded_adapter = ControlNetXSAdapter.from_pretrained(str(cn_dir))
+        adapter_sd = loaded_adapter.state_dict()
+        del loaded_adapter
+
+        synced = self._sync_adapter_to_unet_xs(adapter_sd)
+        self.adapter.load_state_dict(adapter_sd)
+        logger.info(
+            f"Loaded pretrained ControlNet-XS adapter from {cn_dir} "
+            f"({synced} params synced to unet_xs)"
+        )
+
     def _freeze_parameters(self):
-        """冻结 base UNet 参数，仅 adapter 参数可训练。"""
+        """根据 train_unet 配置决定冻结策略。
+
+        利用 freeze_unet_params() 识别 base UNet 与 adapter(ctrl_*) 参数，
+        将 adapter 参数 ID 缓存到 self._ctrl_param_ids 供后续分组学习率使用。
+
+        train_unet=False: 冻结 VAE + TEs + base UNet, 仅 ctrl_* 可训练
+        train_unet=True:  冻结 VAE + TEs, 全部 unet_xs 参数可训练
+        """
         self.vae.requires_grad_(False)
         self.text_encoder.requires_grad_(False)
         if self.text_encoder_2 is not None:
             self.text_encoder_2.requires_grad_(False)
-
-        # UNetControlNetXSModel.freeze_unet_params() 冻结 base UNet 部分，
-        # 保留 adapter（ctrl_*）参数可训练
-        self.unet_xs.freeze_unet_params()
-
-        # 标准 ControlNet Trainer 用的 self.unet 不再参与训练
         self.unet.requires_grad_(False)
 
-        n_trainable = sum(p.numel() for p in self.unet_xs.parameters() if p.requires_grad)
-        n_total = sum(p.numel() for p in self.unet_xs.parameters())
-        logger.info(
-            f"ControlNet-XS freeze: {n_trainable/1e6:.1f}M trainable / "
-            f"{n_total/1e6:.1f}M total ({n_trainable/n_total*100:.1f}%)"
-        )
+        # freeze_unet_params: 先 requires_grad_(True) 再冻结 base 部分，
+        # 剩余 requires_grad=True 的即为 ctrl_* (adapter) 参数
+        self.unet_xs.freeze_unet_params()
+        self._ctrl_param_ids = {id(p) for p in self.unet_xs.parameters() if p.requires_grad}
+
+        if self.train_unet:
+            self.unet_xs.requires_grad_(True)
+            n_ctrl = sum(p.numel() for p in self.unet_xs.parameters() if id(p) in self._ctrl_param_ids)
+            n_base = sum(p.numel() for p in self.unet_xs.parameters() if id(p) not in self._ctrl_param_ids)
+            logger.info(
+                f"全参微调模式: base UNet({n_base/1e6:.1f}M) + XS Adapter({n_ctrl/1e6:.1f}M) "
+                f"= {(n_base + n_ctrl)/1e6:.1f}M trainable"
+            )
+        else:
+            n_trainable = sum(p.numel() for p in self.unet_xs.parameters() if p.requires_grad)
+            n_total = sum(p.numel() for p in self.unet_xs.parameters())
+            logger.info(
+                f"ControlNet-XS freeze: {n_trainable/1e6:.1f}M trainable / "
+                f"{n_total/1e6:.1f}M total ({n_trainable/n_total*100:.1f}%)"
+            )
 
     # ── 辅助结构 loss ─────────────────────────────────────────────────────
 
@@ -314,6 +452,39 @@ class ControlNetXSTrainer(ControlNetTrainer):
         self._last_aux_loss = aux_loss.item()
         return aux_loss
 
+    @torch.no_grad()
+    def _encode_null_prompt(self):
+        """预编码空提示词（用于 caption dropout），在 text_encoder 卸载前调用。
+
+        当 cache_text_embeddings=True 时，_precompute_text_embeddings() 已缓存
+        negative embeddings，无需再调用此方法。仅在 cache_text_embeddings=False
+        且 caption_dropout_rate > 0 时使用。
+        """
+        device = self.accelerator.device
+        if self.model_type == "sdxl":
+            ids_1 = self.tokenizer(
+                "", padding="max_length", truncation=True,
+                max_length=self.tokenizer.model_max_length,
+                return_tensors="pt",
+            ).input_ids.to(device)
+            ids_2 = self.tokenizer_2(
+                "", padding="max_length", truncation=True,
+                max_length=self.tokenizer_2.model_max_length,
+                return_tensors="pt",
+            ).input_ids.to(device)
+            embeds, pooled = self._encode_prompt_sdxl(ids_1, ids_2)
+            self._cached_negative_prompt_embeds = embeds.cpu()
+            self._cached_negative_pooled_prompt_embeds = pooled.cpu()
+        else:
+            ids = self.tokenizer(
+                "", padding="max_length", truncation=True,
+                max_length=self.tokenizer.model_max_length,
+                return_tensors="pt",
+            ).input_ids.to(device)
+            with torch.no_grad():
+                self._cached_negative_prompt_embeds = self.text_encoder(ids)[0].cpu()
+        logger.info(f"Null prompt encoded for caption dropout (rate={self.caption_dropout_rate})")
+
     def train(self):
         """ControlNet-XS 主训练循环。"""
         cache_latents = self.training_cfg.get("cache_latents", False)
@@ -335,6 +506,9 @@ class ControlNetXSTrainer(ControlNetTrainer):
         if self.training_cfg.get("cache_text_embeddings", False):
             self._precompute_text_embeddings()
 
+        if self.caption_dropout_rate > 0 and not hasattr(self, "_cached_negative_prompt_embeds"):
+            self._encode_null_prompt()
+
         # fork 前将 unet_xs 移到 GPU 并回收堆碎片：
         #   1. unet_xs (.to GPU) 释放 ~5.2GB CPU tensor 存储
         #   2. gc + malloc_trim 强制 glibc 归还模型加载期间积累的堆碎片
@@ -354,9 +528,38 @@ class ControlNetXSTrainer(ControlNetTrainer):
         validation_steps = self.training_cfg.get("validation_steps", 500)
         save_steps = self.training_cfg.get("save_steps", 500)
 
-        all_trainable = [p for p in self.unet_xs.parameters() if p.requires_grad]
+        # ── 优化器设置: 全参微调时支持分组学习率 ──
+        # _ctrl_param_ids 在 _freeze_parameters 中由 freeze_unet_params() 识别并缓存
+        controlnet_lr = float(self.cn_cfg.get("controlnet_lr", 0))
+        base_lr = float(self.training_cfg.learning_rate)
 
-        optimizer = self.setup_optimizer(trainable_params=all_trainable)
+        if self.train_unet:
+            base_params = [
+                p for p in self.unet_xs.parameters()
+                if p.requires_grad and id(p) not in self._ctrl_param_ids
+            ]
+            ctrl_params = [
+                p for p in self.unet_xs.parameters()
+                if p.requires_grad and id(p) in self._ctrl_param_ids
+            ]
+            all_trainable = base_params + ctrl_params
+
+            if controlnet_lr > 0:
+                param_groups = [
+                    {"params": base_params, "lr": base_lr},
+                    {"params": ctrl_params, "lr": controlnet_lr},
+                ]
+                optimizer = self.setup_optimizer(param_groups=param_groups)
+                logger.info(
+                    f"分组学习率: base UNet({len(base_params)} tensors) lr={base_lr:.2e}, "
+                    f"ctrl/adapter({len(ctrl_params)} tensors) lr={controlnet_lr:.2e}"
+                )
+            else:
+                optimizer = self.setup_optimizer(trainable_params=all_trainable)
+        else:
+            all_trainable = [p for p in self.unet_xs.parameters() if p.requires_grad]
+            optimizer = self.setup_optimizer(trainable_params=all_trainable)
+
         lr_scheduler = self.setup_lr_scheduler(optimizer, num_train_steps)
 
         self.unet_xs, optimizer, dataloader = (
@@ -365,16 +568,38 @@ class ControlNetXSTrainer(ControlNetTrainer):
             )
         )
 
+        # ── 恢复训练 ──
+        # unet_xs.pt 为权威存档（包含 base UNet + ctrl_* 的完整状态）；
+        # 若不存在则回退到加载 adapter checkpoint（仅 ctrl_* 部分，需同步到 unet_xs）。
         resume_dir = self.training_cfg.get("resume_from_checkpoint", None)
         if resume_dir == "latest":
             resume_dir = self.ckpt_manager.get_latest_checkpoint()
         if resume_dir:
-            state = self.ckpt_manager.load(
-                resume_dir,
-                controlnet=self.accelerator.unwrap_model(self.adapter),
-                optimizer=optimizer,
-                lr_scheduler=lr_scheduler,
-            )
+            unet_xs_file = Path(resume_dir) / "unet_xs.pt"
+            if unet_xs_file.exists():
+                unwrapped = self.accelerator.unwrap_model(self.unet_xs)
+                state_dict = torch.load(unet_xs_file, map_location="cpu", weights_only=True)
+                unwrapped.load_state_dict(state_dict)
+                del state_dict
+                logger.info(f"Loaded full unet_xs state from {unet_xs_file}")
+                state = self.ckpt_manager.load(
+                    resume_dir,
+                    optimizer=optimizer,
+                    lr_scheduler=lr_scheduler,
+                )
+            else:
+                # 旧版 checkpoint 无 unet_xs.pt，用 adapter + key 映射同步到 unet_xs
+                cn_dir = Path(resume_dir) / "controlnet"
+                if cn_dir.exists():
+                    loaded = ControlNetXSAdapter.from_pretrained(str(cn_dir))
+                    synced = self._sync_adapter_to_unet_xs(loaded.state_dict())
+                    del loaded
+                    logger.info(f"Synced adapter checkpoint to unet_xs ({synced} params)")
+                state = self.ckpt_manager.load(
+                    resume_dir,
+                    optimizer=optimizer,
+                    lr_scheduler=lr_scheduler,
+                )
             self.global_step = state["step"]
             self.global_epoch = state["epoch"]
 
@@ -513,6 +738,17 @@ class ControlNetXSTrainer(ControlNetTrainer):
                 prompt_embeds, pooled_prompt_embeds = self._encode_prompt_sdxl(
                     batch["input_ids"], batch["input_ids_2"]
                 )
+
+            if self.caption_dropout_rate > 0 and hasattr(self, "_cached_negative_prompt_embeds"):
+                drop_mask = torch.rand(bsz, device=latents.device) < self.caption_dropout_rate
+                if drop_mask.any():
+                    null_embeds = self._cached_negative_prompt_embeds.to(latents.device)
+                    null_pooled = self._cached_negative_pooled_prompt_embeds.to(latents.device)
+                    prompt_embeds = prompt_embeds.clone()
+                    pooled_prompt_embeds = pooled_prompt_embeds.clone()
+                    prompt_embeds[drop_mask] = null_embeds.expand(drop_mask.sum(), -1, -1)
+                    pooled_prompt_embeds[drop_mask] = null_pooled.expand(drop_mask.sum(), -1)
+
             add_time_ids = self._compute_sdxl_time_ids(batch, bsz, latents.device, prompt_embeds.dtype)
             added_cond_kwargs = {
                 "text_embeds": pooled_prompt_embeds,
@@ -531,6 +767,13 @@ class ControlNetXSTrainer(ControlNetTrainer):
                 encoder_hidden_states = self._cached_prompt_embeds.expand(bsz, -1, -1).to(latents.device)
             else:
                 encoder_hidden_states = self._encode_prompt_sd15(batch["input_ids"])
+
+            if self.caption_dropout_rate > 0 and hasattr(self, "_cached_negative_prompt_embeds"):
+                drop_mask = torch.rand(bsz, device=latents.device) < self.caption_dropout_rate
+                if drop_mask.any():
+                    null_embeds = self._cached_negative_prompt_embeds.to(latents.device)
+                    encoder_hidden_states = encoder_hidden_states.clone()
+                    encoder_hidden_states[drop_mask] = null_embeds.expand(drop_mask.sum(), -1, -1)
 
             noise_pred = self.unet_xs(
                 sample=noisy_latents,
@@ -664,6 +907,10 @@ class ControlNetXSTrainer(ControlNetTrainer):
         if not self.accelerator.is_main_process:
             return
 
+        # 1. 将 unet_xs 训练后的 ctrl_* 参数回写到 adapter，同时复用 state dict
+        xs_sd = self._sync_unet_xs_to_adapter()
+
+        # 2. 保存 adapter（diffusers 格式，可直接用于推理 pipeline）+ 优化器 + 调度器
         self.ckpt_manager.save(
             step=self.global_step,
             global_epoch=self.global_epoch,
@@ -672,3 +919,10 @@ class ControlNetXSTrainer(ControlNetTrainer):
             lr_scheduler=lr_scheduler,
             seed=self.training_cfg.get("seed", 42),
         )
+
+        # 3. 保存完整 unet_xs state dict（权威存档，用于恢复训练）
+        ckpt_dir = Path(self.ckpt_manager.save_dir) / f"step_{self.global_step:06d}"
+        unet_xs_path = ckpt_dir / "unet_xs.pt"
+        torch.save(xs_sd, unet_xs_path)
+        del xs_sd
+        logger.info(f"Checkpoint saved: adapter + unet_xs.pt → {ckpt_dir}")

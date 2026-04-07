@@ -46,7 +46,7 @@ class BucketManager:
     def __init__(self, model_type: str = "sd15", custom_buckets: list = None):
         if custom_buckets:
             self.buckets = custom_buckets
-        elif model_type == "pixart_sigma":
+        elif model_type in ("pixart_sigma", "sana"):
             self.buckets = PIXART_SIGMA_BUCKETS
         elif model_type == "sdxl":
             self.buckets = SDXL_BUCKETS

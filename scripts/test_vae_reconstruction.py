@@ -5,7 +5,7 @@
   - 对数据集中随机采样的图像做 encode → decode 重建
   - 计算 PSNR / SSIM / MSE / MAE 等量化指标
   - 将 原图 | 重建图 | 差异热力图 拼合保存，便于目视检查
-  - 支持 SD1.5（512×512）、SDXL（1024×1024）和 PixArt-Sigma（1024×1024）
+  - 支持 SD1.5（512×512）、SDXL（1024×1024）、PixArt-Sigma（1024×1024）和 Sana（1024×1024）
   - 支持 --image_list 保证两次测试使用完全相同的图片集合
 
 用法示例:
@@ -13,6 +13,7 @@
   python scripts/test_vae_reconstruction.py --model_type sd15 --num_images 50
   python scripts/test_vae_reconstruction.py --model_type sdxl --num_images 50
   python scripts/test_vae_reconstruction.py --model_type pixart_sigma --num_images 50
+  python scripts/test_vae_reconstruction.py --model_type sana --num_images 50
 
   # ── 同时测试 SDXL 与 PixArt-Sigma（结果各存独立子目录）──
   # 第一步：测试 SDXL，保存采样列表
@@ -25,18 +26,8 @@
       --model_type pixart_sigma \
       --image_list ./outputs/shared_list_1024.json
 
-  # ── 保证测试集相同（推荐对比两个模型时使用）──
-  # 第一步：测试 SD1.5，同时把采样列表保存到 shared_list.json
-  python scripts/test_vae_reconstruction.py \
-      --model_type sd15 --num_images 50 \
-      --image_list ./outputs/shared_list.json \
-      --output_dir ./outputs/vae_test_sd15
-
-  # 第二步：测试 SDXL，自动从同一个 json 中读取，找对应 1024 分辨率版本
-  python scripts/test_vae_reconstruction.py \
-      --model_type sdxl \
-      --image_list ./outputs/shared_list.json \
-      --output_dir ./outputs/vae_test_sdxl
+  # ── Sana 0.6B VAE 测试（AutoencoderDC, 32x 压缩, 32 通道）──
+  python scripts/test_vae_reconstruction.py --model_type sana --num_images 50
 
   # ── 自定义 VAE 路径 ──
   python scripts/test_vae_reconstruction.py \
@@ -89,6 +80,13 @@ MODEL_DEFAULTS = {
         "slug": "PixArt-alpha--PixArt-Sigma-XL-2-1024-MS",
         "resolution": 1024,
         "data_subdir": "size_1024",
+    },
+    "sana": {
+        "slug": "Efficient-Large-Model--Sana_600M_1024px_diffusers",
+        "resolution": 1024,
+        "data_subdir": "size_1024",
+        "vae_class": "AutoencoderDC",
+        "spatial_compression": 32,
     },
 }
 
@@ -320,9 +318,14 @@ def run_test(args: argparse.Namespace) -> None:
         torch.cuda.reset_peak_memory_stats(device)
 
     # ── 加载 VAE ──
-    logger.info(f"加载 VAE: {vae_path}  dtype={dtype}")
+    is_dc_ae = (not args.vae_path and MODEL_DEFAULTS.get(args.model_type, {}).get("vae_class") == "AutoencoderDC")
+    logger.info(f"加载 VAE: {vae_path}  dtype={dtype}  class={'AutoencoderDC' if is_dc_ae else 'AutoencoderKL'}")
     t0  = time.time()
-    vae = AutoencoderKL.from_pretrained(str(vae_path), torch_dtype=dtype)
+    if is_dc_ae:
+        from diffusers import AutoencoderDC
+        vae = AutoencoderDC.from_pretrained(str(vae_path), torch_dtype=dtype)
+    else:
+        vae = AutoencoderKL.from_pretrained(str(vae_path), torch_dtype=dtype)
     vae = vae.to(device).eval()
     load_sec = time.time() - t0
     param_mb = sum(p.numel() * p.element_size() for p in vae.parameters()) / 1024 ** 2
@@ -356,14 +359,15 @@ def run_test(args: argparse.Namespace) -> None:
             torch.cuda.reset_peak_memory_stats(device)
 
         with torch.no_grad():
-            # Encode
-            posterior = vae.encode(orig_tensor).latent_dist
-            latents   = posterior.sample()        # (1, C_lat, H/8, W/8)
+            enc_out = vae.encode(orig_tensor)
+            if hasattr(enc_out, "latent_dist"):
+                latents = enc_out.latent_dist.sample()
+            else:
+                latents = enc_out.latent
             latents_scaled = latents * vae.config.scaling_factor
 
             latent_stds.append(latents_scaled.float().std().item())
 
-            # Decode
             recon_tensor = vae.decode(latents_scaled / vae.config.scaling_factor).sample
 
         peak_mb = vram_peak_mb()
@@ -418,7 +422,9 @@ def run_test(args: argparse.Namespace) -> None:
     print(f"  PSNR  : avg={np.mean(all_psnr):.2f}dB  min={np.min(all_psnr):.2f}  max={np.max(all_psnr):.2f}")
     print(f"  SSIM  : avg={np.mean(all_ssim):.4f}  min={np.min(all_ssim):.4f}  max={np.max(all_ssim):.4f}")
     print(f"  Latent std (scaled): avg={np.mean(latent_stds):.3f}")
-    print(f"  Latent 空间维度    : {vae.config.latent_channels} ch @ {resolution//8}×{resolution//8}")
+    spatial_comp = MODEL_DEFAULTS.get(args.model_type, {}).get("spatial_compression", 8) if not args.vae_path else 8
+    latent_res = resolution // spatial_comp
+    print(f"  Latent 空间维度    : {vae.config.latent_channels} ch @ {latent_res}×{latent_res} (spatial {spatial_comp}x)")
     if device.type == "cuda":
         total_peak = torch.cuda.max_memory_allocated(device) / 1024 ** 2
         param_mb_val = sum(p.numel() * p.element_size() for p in vae.parameters()) / 1024 ** 2
@@ -464,8 +470,8 @@ def parse_args() -> argparse.Namespace:
     # 模型选择
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
-        "--model_type", choices=["sd15", "sdxl", "pixart_sigma"], default="sdxl",
-        help="使用预设的 SD1.5 / SDXL / PixArt-Sigma VAE（默认: sdxl）",
+        "--model_type", choices=["sd15", "sdxl", "pixart_sigma", "sana"], default="sdxl",
+        help="使用预设的 SD1.5 / SDXL / PixArt-Sigma / Sana VAE（默认: sdxl）",
     )
     group.add_argument(
         "--vae_path", default=None,
@@ -542,7 +548,7 @@ if __name__ == "__main__":
         logger.info(f"  VAE 路径 : {args.vae_path}")
         logger.info(f"  分辨率   : {args.resolution}")
     else:
-        display_names = {"sd15": "SD1.5", "sdxl": "SDXL", "pixart_sigma": "PixArt-Sigma"}
+        display_names = {"sd15": "SD1.5", "sdxl": "SDXL", "pixart_sigma": "PixArt-Sigma", "sana": "Sana 0.6B"}
         logger.info(f"  模型类型 : {display_names.get(args.model_type, args.model_type.upper())}")
         cfg = MODEL_DEFAULTS[args.model_type]
         logger.info(f"  权重路径 : weights/{cfg['slug']}/vae")

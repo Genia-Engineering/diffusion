@@ -1,0 +1,77 @@
+# ============================================================
+# Sana 0.6B 全参数微调配置 — 建筑平面图
+# 训练范式: Rectified Flow (Flow Matching, DPMSolver flow_prediction)
+#   x_t = t*x_1 + (1-t)*x_0,  target = x_0 - x_1 (velocity)
+# 硬件: 4× NVIDIA A10G (23GB each)
+# 数据集: ~3400 张 1024×1024 PNG
+#
+# 模型特点:
+#   - Transformer: SanaTransformer2DModel (Linear DiT, ~600M)
+#   - Text Encoder: Gemma-2-2B-IT (~5GB, 比 T5-XXL 轻量)
+#   - VAE: AutoencoderDC (32x 压缩, 32 latent channels)
+#   - Scheduler: DPMSolverMultistepScheduler (flow_prediction, flow_shift=3.0)
+#
+# 启动方式:
+#   bash train.sh sana                  # 标准多卡
+#   bash train.sh sana resume           # 恢复训练
+# ============================================================
+
+model:
+  pretrained_model_name_or_path: "Efficient-Large-Model/Sana_600M_1024px_diffusers"
+  model_type: "sana"
+  weights_dir: "/home/daiqing_tan/stable_diffusion_lora/weights"
+
+training:
+  output_dir: "./outputs/sana_floorplan"
+  num_train_steps: 4200
+  learning_rate: 1.0e-4
+  train_batch_size: 32
+  gradient_accumulation_steps: 2
+  mixed_precision: "no"
+  cache_latents: true
+  cache_text_embeddings: true
+  latent_cache_batch_size: 4
+
+  validation_steps: 300
+  save_steps: 300
+  keep_last_n_checkpoints: 12
+  lr_warmup_steps: 150
+  gradient_checkpointing: true
+  compile_model: false
+  max_grad_norm: 1.0
+  loss_type: "mse"
+  caption_dropout_rate: 0.1
+
+  # 噪声范式
+  noise_paradigm: "flow_matching"
+
+  # Flow Matching 参数
+  timestep_sampling: "logit_normal"
+  logit_mean: 0.0
+  logit_std: 1.0
+  scheduler_shift: 3.0               # Sana 默认 flow_shift=3.0
+
+data:
+  train_data_dir: "/home/daiqing_tan/stable_diffusion_lora/data/data/size_1024/floor"
+  resolution: 1024
+  use_aspect_ratio_bucketing: false
+  pad_color: [0, 0, 0]
+
+  caption_mode: "fixed"
+  caption: "architectural floor plan, blueprint, technical drawing"
+
+  caption_dir: "/home/daiqing_tan/stable_diffusion_lora/data/data/description"
+  caption_stem_replace:
+    from: "___total__1024"
+    to: "_controlnet_color_1024"
+  caption_fallback: "architectural floor plan, blueprint, technical drawing"
+
+validation:
+  prompts:
+    - "architectural floor plan, blueprint, technical drawing"
+  prompt_source: "config"
+  negative_prompt: ""
+  num_inference_steps: 20
+  guidance_scale: [4.5, 2.0, 1.0]
+  seed: 42
+  num_images_per_prompt: 4

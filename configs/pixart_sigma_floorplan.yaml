@@ -32,22 +32,23 @@ model:
 
 training:
   output_dir: "./outputs/pixart_sigma_floorplan"
-  num_train_steps: 2400              # ~60 epoch (3432 images, effective_batch=64, 54 step/epoch)
-  learning_rate: 2.0e-4              # 全参 DDPM + 加权 Loss: 比 FM 的 2e-5 减半，避免加权梯度过大导致震荡
-  train_batch_size: 64                # 每 GPU 8 个样本（gc=ON 时实测 ~12-14GB，安全）
+  num_train_steps: 3600              # ~60 epoch (3432 images, effective_batch=64, 54 step/epoch)
+  learning_rate: 1.0e-4              # 全参 DDPM + 加权 Loss: 比 FM 的 2e-5 减半，避免加权梯度过大导致震荡
+  train_batch_size: 32                # 每 GPU 8 个样本（gc=ON 时实测 ~12-14GB，安全）
   gradient_accumulation_steps: 2     # effective batch = 8×4GPU×2accum = 64
   mixed_precision: "bf16"
   cache_latents: true
   cache_text_embeddings: true
   latent_cache_batch_size: 4         # VAE 预计算 batch size（4 卡并行，每卡 8 张 1024 分辨率）
 
-  validation_steps: 200              # 每 540 步验证一次（约每 10 epoch）
-  save_steps: 200                    # 每 10 epoch 保存一次
-  keep_last_n_checkpoints: 8
-  lr_warmup_steps: 100               # 前 ~6 epoch warmup (~10% 总步数)
+  validation_steps: 300              # 每 540 步验证一次（约每 10 epoch）
+  save_steps: 300                    # 每 10 epoch 保存一次
+  keep_last_n_checkpoints: 12
+  lr_warmup_steps: 150               # 前 ~6 epoch warmup (~10% 总步数)
   gradient_checkpointing: true       # 开启后激活值显存大幅下降（batch=8 约 12-14GB）
   compile_model: false               # autotune 第一步峰值显存冲至 ~22GB 导致 OOM，保持关闭
   loss_type: "mse"
+  caption_dropout_rate: 0.1           # 每步以此概率将提示词随机置空，支持 classifier-free guidance
 
   # 噪声范式: "flow_matching" (Rectified Flow velocity) 或 "ddpm" (epsilon/v-prediction)
   noise_paradigm: "ddpm"
@@ -88,7 +89,7 @@ data:
   # ── caption 模式 ──
   # "fixed":     所有图片共用 caption 字段的统一提示词
   # "per_image": 每张图片从 caption_dir 读取对应的 .txt 描述文件（结构化信息）
-  caption_mode: "per_image"
+  caption_mode: "fixed"
 
   # 统一提示词（caption_mode=fixed 时生效）
   caption: "architectural floor plan, blueprint, technical drawing"
@@ -117,7 +118,7 @@ validation:
   # prompt_source: 验证时文本提示词的来源
   #   "config"  — 使用上方 prompts 列表中的每个提示词（默认，适合对比不同描述的泛化能力）
   #   "data"    — 使用 data.caption（训练 caption），忽略 prompts 列表
-  prompt_source: "data"
+  prompt_source: "config"
 
   negative_prompt: ""
   num_inference_steps: 50

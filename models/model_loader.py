@@ -65,6 +65,22 @@ _ALLOW_PATTERNS_PIXART_SIGMA = [
     "scheduler/**",
 ]
 
+_ALLOW_PATTERNS_SANA = [
+    "model_index.json",
+    "transformer/config.json",
+    "transformer/*.safetensors",
+    "vae/config.json",
+    "vae/*.safetensors",
+    "text_encoder/config.json",
+    "text_encoder/*.safetensors",
+    "text_encoder/*.index.json",
+    "tokenizer/**",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "scheduler/**",
+]
+
 # 无论哪种模型都排除的文件
 _IGNORE_PATTERNS_COMMON = [
     "*.fp16.safetensors",      # fp16 副本，训练用 bf16/fp32 不需要
@@ -112,6 +128,8 @@ def resolve_model_path(
 
     if model_type == "pixart_sigma":
         allow_patterns = _ALLOW_PATTERNS_PIXART_SIGMA
+    elif model_type == "sana":
+        allow_patterns = _ALLOW_PATTERNS_SANA
     elif model_type == "sdxl":
         allow_patterns = _ALLOW_PATTERNS_SDXL
     else:
@@ -300,6 +318,70 @@ def load_pixart_sigma_components(
         patch_fm_scheduler_for_pipeline(noise_scheduler)
     else:
         noise_scheduler = DDPMScheduler.from_pretrained(path, subfolder="scheduler")
+
+    return {
+        "vae": vae,
+        "transformer": transformer,
+        "text_encoder": text_encoder,
+        "tokenizer": tokenizer,
+        "noise_scheduler": noise_scheduler,
+    }
+
+
+def load_sana_components(
+    pretrained_model_name_or_path: str,
+    weights_dir: str = None,
+    dtype: torch.dtype = torch.float32,
+    flow_shift: float = 3.0,
+    load_text_encoder: bool = True,
+) -> dict:
+    """加载 Sana 0.6B 训练所需全部组件。
+
+    Sana 使用 SanaTransformer2DModel (Linear DiT) 替代 UNet，
+    Gemma-2-2B-IT 替代 T5/CLIP 文本编码器，AutoencoderDC (32x 压缩) 替代标准 VAE。
+
+    Args:
+        flow_shift: DPMSolverMultistepScheduler 的 flow_shift 参数（默认 3.0）。
+        load_text_encoder: False 时跳过 Gemma2 和 tokenizer 的加载。
+
+    Returns:
+        {
+            "vae": AutoencoderDC,
+            "transformer": SanaTransformer2DModel,
+            "text_encoder": Gemma2Model | None,
+            "tokenizer": GemmaTokenizerFast | None,
+            "noise_scheduler": DPMSolverMultistepScheduler,
+        }
+    """
+    from diffusers import AutoencoderDC, SanaTransformer2DModel, DPMSolverMultistepScheduler
+    from transformers import AutoTokenizer, AutoModel
+
+    path = resolve_model_path(pretrained_model_name_or_path, weights_dir, model_type="sana")
+
+    if load_text_encoder:
+        tokenizer = AutoTokenizer.from_pretrained(path, subfolder="tokenizer")
+        text_encoder = AutoModel.from_pretrained(path, subfolder="text_encoder", torch_dtype=dtype)
+    else:
+        tokenizer = None
+        text_encoder = None
+
+    vae = AutoencoderDC.from_pretrained(path, subfolder="vae", torch_dtype=dtype)
+    transformer = SanaTransformer2DModel.from_pretrained(path, subfolder="transformer", torch_dtype=dtype)
+
+    noise_scheduler = DPMSolverMultistepScheduler(
+        num_train_timesteps=1000,
+        beta_start=0.0001,
+        beta_end=0.02,
+        beta_schedule="linear",
+        prediction_type="flow_prediction",
+        use_flow_sigmas=True,
+        flow_shift=flow_shift,
+        algorithm_type="dpmsolver++",
+        solver_order=2,
+        solver_type="midpoint",
+        lower_order_final=True,
+        final_sigmas_type="zero",
+    )
 
     return {
         "vae": vae,

@@ -1,23 +1,20 @@
-"""PixArt-Sigma 全参数微调训练器 — 支持 Flow Matching 和 DDPM 双噪声范式。
+"""Sana 0.6B 全参数微调训练器 — 支持 Flow Matching 和 DDPM 双噪声范式。
 
 通过配置项 noise_paradigm 切换训练范式:
 
 1. Flow Matching (noise_paradigm="flow_matching"):
-   sigma 参数化, 与 FlowMatchEulerDiscreteScheduler 对齐
+   sigma 参数化, 与 DPMSolverMultistepScheduler (flow_prediction) 对齐
    - 前向插值: x_t = t*x_1 + (1-t)*x_0, sigma = 1-t
    - 预测目标: velocity = x_0 - x_1 (noise - clean)
    - 时间步采样: t ~ Logit-Normal 或 Uniform(0,1), timestep = (1-t)*1000
 
 2. DDPM (noise_paradigm="ddpm"):
    epsilon/v-prediction, 与 DDPMScheduler 对齐
-   - 前向加噪: scheduler.add_noise(latents, noise, timesteps)
-   - 预测目标: epsilon (noise) 或 v-prediction
-   - 时间步采样: t ~ Uniform{0..num_train_timesteps-1}
 
 权重冻结策略:
-  - VAE: 全冻结，预缓存 latent 后卸载 encoder
-  - T5 Text Encoder: 全冻结，预缓存嵌入后完全卸载
-  - PixArtTransformer2DModel: 全部参数可训练（~611M）
+  - VAE (AutoencoderDC): 全冻结，预缓存 latent 后卸载 encoder
+  - Gemma2 Text Encoder: 全冻结，预缓存嵌入后完全卸载
+  - SanaTransformer2DModel: 全部参数可训练
 """
 
 import logging
@@ -32,11 +29,8 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from data.buckets import BucketManager, BucketSampler
-from data.dataset import (
-    PixArtSigmaCachedLatentDataset,
-    PixArtSigmaDataset,
-)
-from models.model_loader import load_pixart_sigma_components
+from data.dataset import SanaCachedLatentDataset
+from models.model_loader import load_sana_components
 from utils.fid import FIDCalculator
 from utils.memory import apply_memory_optimizations
 from utils.validation import ValidationLoop
@@ -45,14 +39,13 @@ from .base_trainer import BaseTrainer
 logger = logging.getLogger(__name__)
 
 
-class PixArtSigmaTrainer(BaseTrainer):
-    """PixArt-Sigma 全参数微调训练器。"""
+class SanaTrainer(BaseTrainer):
+    """Sana 0.6B 全参数微调训练器。"""
 
     def __init__(self, config: DictConfig):
         super().__init__(config)
-        self.model_type = config.model.model_type  # "pixart_sigma"
+        self.model_type = config.model.model_type  # "sana"
 
-        # 噪声范式: "flow_matching" 或 "ddpm"
         self.noise_paradigm: str = self.training_cfg.get("noise_paradigm", "flow_matching")
 
         # Flow Matching 参数
@@ -70,10 +63,11 @@ class PixArtSigmaTrainer(BaseTrainer):
         self.spatial_weight_threshold: float = float(self.training_cfg.get("spatial_weight_threshold", 0.1))
         self.channel_0_weight: float = float(self.training_cfg.get("channel_0_weight", 1.0))
 
+        self.scheduler_shift: float = float(self.training_cfg.get("scheduler_shift", 3.0))
+
         self._load_models()
         self._freeze_parameters()
 
-        # DDPM 模式下预计算 SNR 查找表（Min-SNR 加权需要）
         self._snr_cache: torch.Tensor | None = None
         if self.noise_paradigm == "ddpm" and self.min_snr_gamma > 0:
             alphas_cumprod = self.noise_scheduler.alphas_cumprod
@@ -91,12 +85,12 @@ class PixArtSigmaTrainer(BaseTrainer):
     def _load_models(self):
         model_path = self.config.model.pretrained_model_name_or_path
         weights_dir = self.config.model.get("weights_dir", None)
-        scheduler_shift = float(self.training_cfg.get("scheduler_shift", 1.0))
-        use_flow_matching = self.noise_paradigm == "flow_matching"
+        flow_shift = float(self.training_cfg.get("scheduler_shift", 3.0))
 
-        components = load_pixart_sigma_components(
-            model_path, weights_dir=weights_dir, scheduler_shift=scheduler_shift,
-            flow_matching=use_flow_matching,
+        components = load_sana_components(
+            model_path,
+            weights_dir=weights_dir,
+            flow_shift=flow_shift,
         )
         self.vae = components["vae"]
         self.transformer = components["transformer"]
@@ -104,8 +98,9 @@ class PixArtSigmaTrainer(BaseTrainer):
         self.tokenizer = components["tokenizer"]
         self.noise_scheduler = components["noise_scheduler"]
 
-        # DDPM 模式：允许配置覆盖 prediction_type
-        if not use_flow_matching:
+        if self.noise_paradigm == "flow_matching":
+            logger.info("噪声范式: Flow Matching (Rectified Flow, DPMSolver flow_prediction)")
+        else:
             override_pred_type = self.training_cfg.get("prediction_type", None)
             if override_pred_type and override_pred_type != self.noise_scheduler.config.prediction_type:
                 self.noise_scheduler.register_to_config(prediction_type=override_pred_type)
@@ -113,8 +108,6 @@ class PixArtSigmaTrainer(BaseTrainer):
             logger.info(
                 f"噪声范式: DDPM (prediction_type={self.noise_scheduler.config.prediction_type})"
             )
-        else:
-            logger.info("噪声范式: Flow Matching (Rectified Flow, sigma velocity)")
 
     def _freeze_parameters(self):
         self.vae.requires_grad_(False)
@@ -123,7 +116,6 @@ class PixArtSigmaTrainer(BaseTrainer):
         self.print_trainable_params(self.transformer)
 
     def _text_embed_cache_exists(self) -> bool:
-        """检查文本嵌入缓存是否已存在，避免不必要地将 T5 移至 GPU。"""
         import hashlib
         caption = self.config.data.get("caption", "")
         neg_prompt = self.config.get("validation", {}).get("negative_prompt", "")
@@ -134,12 +126,11 @@ class PixArtSigmaTrainer(BaseTrainer):
 
     @torch.no_grad()
     def _encode_null_prompt(self):
-        """预编码空提示词（用于 caption dropout），在 text_encoder 卸载前调用。"""
         device = self.text_encoder.device
-        t5_max_len = 300
+        max_seq_len = 300
         tokenized = self.tokenizer(
             "", padding="max_length", truncation=True,
-            max_length=t5_max_len, return_tensors="pt",
+            max_length=max_seq_len, return_tensors="pt",
         )
         ids = tokenized.input_ids.to(device)
         attn_mask = tokenized.attention_mask.to(device)
@@ -162,7 +153,7 @@ class PixArtSigmaTrainer(BaseTrainer):
                 and self.training_cfg.get("cache_text_embeddings", False)
                 else None
             )
-            dataset = PixArtSigmaCachedLatentDataset(
+            dataset = SanaCachedLatentDataset(
                 data_dir=data_cfg.train_data_dir,
                 cache_dir=cache_dir,
                 tokenizer=self.tokenizer,
@@ -172,6 +163,7 @@ class PixArtSigmaTrainer(BaseTrainer):
                 text_embed_cache_dir=text_embed_cache_dir,
             )
         else:
+            from data.dataset import PixArtSigmaDataset
             dataset = PixArtSigmaDataset(
                 data_dir=data_cfg.train_data_dir,
                 tokenizer=self.tokenizer,
@@ -198,11 +190,6 @@ class PixArtSigmaTrainer(BaseTrainer):
                 drop_last=True,
             )
         else:
-            if cache_latents:
-                logger.info(
-                    f"分桶已关闭，所有图片 pad 至 {resolution}×{resolution}，"
-                    f"使用标准 shuffle DataLoader"
-                )
             dataloader = DataLoader(
                 dataset,
                 batch_size=batch_size,
@@ -222,60 +209,43 @@ class PixArtSigmaTrainer(BaseTrainer):
         logger.info("\n".join(lines))
 
     def _sample_real_images(self, n: int) -> list:
-        """从训练数据集随机采样 n 张原始 PIL 图像，供 FID 计算使用。"""
         import random
         from data.dataset import BaseImageDataset
-
         data_cfg = self.config.data
         resolution = data_cfg.get("resolution", 1024)
-
         dataset = BaseImageDataset(
             data_dir=data_cfg.train_data_dir,
             resolution=resolution,
             center_crop=data_cfg.get("center_crop", False),
             random_flip=False,
         )
-
         indices = random.sample(range(len(dataset)), min(n, len(dataset)))
-        images = [dataset.get_pil_image(i) for i in indices]
-        return images
+        return [dataset.get_pil_image(i) for i in indices]
 
     def _load_val_ground_truth_images(self, n: int) -> list:
-        """从训练数据集按顺序取前 n 张图作为验证对比用的 ground truth。
-
-        使用固定顺序（非随机）确保每次验证对比的是同一批图像，
-        便于直观追踪过拟合进度。
-        """
         from data.dataset import BaseImageDataset
-
         data_cfg = self.config.data
         resolution = data_cfg.get("resolution", 1024)
-
         dataset = BaseImageDataset(
             data_dir=data_cfg.train_data_dir,
             resolution=resolution,
             center_crop=data_cfg.get("center_crop", False),
             random_flip=False,
         )
-
         indices = list(range(min(n, len(dataset))))
-        images = [dataset.get_pil_image(i) for i in indices]
-        return images
+        return [dataset.get_pil_image(i) for i in indices]
 
     def train(self):
-        """PixArt-Sigma 全参数微调主训练循环。"""
+        """Sana 0.6B 全参数微调主训练循环。"""
         cache_latents = self.training_cfg.get("cache_latents", False)
         cache_text_embeddings = self.training_cfg.get("cache_text_embeddings", False)
 
-        # ── 阶段1：VAE latent 预计算（完成后卸载 encoder 释放显存）────────────
+        # ── 阶段1：VAE latent 预计算 ────────────────────────────────────────
         self.vae.to(self.accelerator.device, dtype=torch.float32)
         if cache_latents:
             self._precompute_latents_distributed(self._get_latent_cache_dir())
 
-        # ── 阶段2：T5 文本嵌入预计算（必须在 accelerator.prepare 之前完成）─────
-        # T5-XXL 在 bf16 下约 11 GB，accelerator.prepare 后 DiT+optimizer 约 14 GB，
-        # 两者同时在 GPU 会 OOM。先做文本预计算再卸载 T5，再走 prepare。
-        # 仅在缓存不存在时才将 T5 移至 GPU 进行编码；缓存命中则直接从磁盘加载，跳过 GPU 占用。
+        # ── 阶段2：Gemma2 文本嵌入预计算 ────────────────────────────────────
         caption_mode = self.config.data.get("caption_mode", "fixed")
         self._per_image_caption = (caption_mode == "per_image") and bool(self.config.data.get("caption_dir", None))
         if caption_mode == "per_image" and not self.config.data.get("caption_dir", None):
@@ -293,14 +263,13 @@ class PixArtSigmaTrainer(BaseTrainer):
                 if need_encode:
                     self.text_encoder.to(self.accelerator.device)
                 self._precompute_text_embeddings()
-            # _precompute_text_embeddings 内部会 del self.text_encoder 并 empty_cache
         else:
             self.text_encoder.to(self.accelerator.device)
 
         if self.caption_dropout_rate > 0 and not hasattr(self, "_cached_negative_prompt_embeds"):
             self._encode_null_prompt()
 
-        # ── 阶段3：准备训练组件（DiT + optimizer 上 GPU）────────────────────────
+        # ── 阶段3：准备训练组件 ──────────────────────────────────────────────
         dataloader = self._build_dataloader()
         num_train_steps = self.training_cfg.get("num_train_steps", 5000)
         max_grad_norm = self.training_cfg.get("max_grad_norm", 1.0)
@@ -316,7 +285,6 @@ class PixArtSigmaTrainer(BaseTrainer):
             if use_deepspeed:
                 logger.warning(
                     "检测到 DeepSpeed（ZeRO），跳过 torch.compile。"
-                    "两者同时使用会导致双重 wrapping，引发 fp32 强制转换和显存峰值激增。"
                 )
             else:
                 logger.info("Compiling transformer with torch.compile (mode=max-autotune-no-cudagraphs)...")
@@ -328,7 +296,6 @@ class PixArtSigmaTrainer(BaseTrainer):
             self.transformer, optimizer, dataloader
         )
 
-        # cache_text_embeddings=False 时 text_encoder 仍需移到 GPU（实时编码路径）
         if not cache_text_embeddings and self.text_encoder is not None:
             self.text_encoder.to(self.accelerator.device)
 
@@ -348,9 +315,9 @@ class PixArtSigmaTrainer(BaseTrainer):
             self.global_epoch = state["epoch"]
             for _ in range(self.global_step):
                 lr_scheduler.step()
-            logger.info(f"Resumed from step {self.global_step}, lr_scheduler re-synced to step {self.global_step}")
+            logger.info(f"Resumed from step {self.global_step}")
 
-        # FID 计算器初始化
+        # FID
         val_cfg = self.config.get("validation", {})
         fid_calculator = None
         if val_cfg.get("compute_fid", False):
@@ -402,21 +369,17 @@ class PixArtSigmaTrainer(BaseTrainer):
             img2img_strengths=img2img_strengths,
         )
 
-        # 加载验证用 ground truth：固定取训练集前 N 张（N = prompt 数量），
-        # 每次验证都与这些图对比，直观追踪过拟合进度。
         val_gt_images = None
         if self.accelerator.is_main_process:
             val_gt_images = self._load_val_ground_truth_images(len(val_prompts))
             logger.info(f"验证 ground truth 加载完成：{len(val_gt_images)} 张训练图")
 
-        # best loss 追踪：EMA 平滑逐步检查，遇到新低即保存
         self._ema_loss = None
-        self._ema_decay = 0.99  # ~100 步窗口
+        self._ema_decay = 0.99
         self._best_ema_loss = float("inf")
         self._last_best_save_step = 0
-        self._min_best_save_interval = max(save_steps // 4, 50)  # 最小保存间隔
+        self._min_best_save_interval = max(save_steps // 4, 50)
 
-        # 训练主循环
         gradient_accumulation_steps = self.training_cfg.get("gradient_accumulation_steps", 1)
         steps_per_epoch = math.ceil(len(dataloader) / gradient_accumulation_steps)
         num_epochs = math.ceil(num_train_steps / max(steps_per_epoch, 1))
@@ -476,20 +439,21 @@ class PixArtSigmaTrainer(BaseTrainer):
         logger.info("Training complete!")
 
     def _training_step(self, batch) -> torch.Tensor:
-        """单步训练，根据 noise_paradigm 分发到 Flow Matching 或 DDPM 路径。"""
-        # ── 获取 clean latent ──
         if "latents" in batch:
             latents = batch["latents"].to(self.accelerator.device)
         else:
             pixel_values = batch["pixel_values"].to(dtype=self.vae.dtype)
             with torch.no_grad():
-                latents = self.vae.encode(pixel_values).latent_dist.sample()
+                enc_out = self.vae.encode(pixel_values)
+                if hasattr(enc_out, "latent_dist"):
+                    latents = enc_out.latent_dist.sample()
+                else:
+                    latents = enc_out.latent
                 latents = latents * self.vae.config.scaling_factor
 
         bsz = latents.shape[0]
         noise = torch.randn_like(latents)
 
-        # ── 获取文本条件 ──
         if "prompt_embeds" in batch:
             prompt_embeds = batch["prompt_embeds"].to(latents.device)
             attention_mask = batch["prompt_attention_mask"].to(latents.device)
@@ -503,7 +467,6 @@ class PixArtSigmaTrainer(BaseTrainer):
                 prompt_embeds = self.text_encoder(input_ids, attention_mask=attn_mask)[0]
             attention_mask = attn_mask
 
-        # ── caption dropout ──
         if self.caption_dropout_rate > 0:
             drop_mask = torch.rand(bsz, device=latents.device) < self.caption_dropout_rate
             if drop_mask.any():
@@ -525,23 +488,28 @@ class PixArtSigmaTrainer(BaseTrainer):
             return self._training_step_ddpm(latents, noise, bsz, prompt_embeds, attention_mask, weight_mask, padding_mask)
 
     def _training_step_fm(self, latents, noise, bsz, prompt_embeds, attention_mask, padding_mask=None) -> torch.Tensor:
-        """Flow Matching 训练步: 线性插值 → velocity prediction → MSE loss。
+        """Flow Matching 训练步: Rectified Flow velocity prediction。
 
-        Rectified Flow (sigma 参数化):
-          x_t = t*clean + (1-t)*noise, sigma = 1-t
-          target = noise - clean (sigma velocity)
-          timestep = sigma * 1000 = (1-t) * 1000
+        Sana 使用 DPMSolverMultistepScheduler (flow_shift=3.0) 的 shifted sigma schedule:
+          sigma = shift * u / (1 + (shift - 1) * u)
+        训练时必须使用相同的 shift 以保持 timestep-to-noise-level 映射一致。
+
+        SanaTransformer2DModel 输出 32 通道（与输入 latent 通道一致），
+        不需要像 PixArt 那样 chunk(2, dim=1) 拆分。
         """
         if self.timestep_sampling == "logit_normal":
-            t = torch.sigmoid(
+            u = torch.sigmoid(
                 self.logit_mean + self.logit_std * torch.randn(bsz, device=latents.device)
             )
         else:
-            t = torch.rand(bsz, device=latents.device)
+            u = torch.rand(bsz, device=latents.device)
 
-        t_expanded = t.view(-1, 1, 1, 1)
-        noisy_latents = t_expanded * latents + (1.0 - t_expanded) * noise
-        timesteps_scaled = (1.0 - t) * 1000.0
+        shift = self.scheduler_shift
+        sigma = shift * u / (1.0 + (shift - 1.0) * u)
+
+        sigma_expanded = sigma.view(-1, 1, 1, 1)
+        noisy_latents = (1.0 - sigma_expanded) * latents + sigma_expanded * noise
+        timesteps_scaled = sigma * 1000.0
 
         model_output = self.transformer(
             hidden_states=noisy_latents,
@@ -549,9 +517,6 @@ class PixArtSigmaTrainer(BaseTrainer):
             encoder_hidden_states=prompt_embeds,
             encoder_attention_mask=attention_mask,
         ).sample
-
-        if model_output.shape[1] != latents.shape[1]:
-            model_output, _ = model_output.chunk(2, dim=1)
 
         target = noise - latents
 
@@ -562,13 +527,10 @@ class PixArtSigmaTrainer(BaseTrainer):
         return F.mse_loss(model_output.float(), target.float())
 
     def _get_weight_mask(self, batch, latents) -> torch.Tensor | None:
-        """从 batch 获取或计算亮度权重掩码 (B, 1, H, W)，与 latent 同分辨率。"""
         if self.spatial_weight_scale <= 0:
             return None
-
         if "weight_mask" in batch:
             return batch["weight_mask"].to(latents.device)
-
         if "pixel_values" in batch:
             pv = batch["pixel_values"].to(latents.device).float()
             pv_01 = (pv + 1.0) / 2.0
@@ -580,11 +542,6 @@ class PixArtSigmaTrainer(BaseTrainer):
         return None
 
     def _build_loss_weights(self, latents, weight_mask, padding_mask=None) -> torch.Tensor | None:
-        """组合空间权重、通道权重和 padding 掩码为 (B, C, H, W) 张量。
-
-        padding_mask: (B, 1, H, W)，内容区域=1 / padding=0。
-        当存在 padding_mask 时，padding 区域的权重被置零，loss 不计算黑边部分。
-        """
         has_spatial = self.spatial_weight_scale > 0 and weight_mask is not None
         has_channel = self.channel_0_weight != 1.0
         has_padding = padding_mask is not None
@@ -613,7 +570,6 @@ class PixArtSigmaTrainer(BaseTrainer):
         return combined
 
     def _training_step_ddpm(self, latents, noise, bsz, prompt_embeds, attention_mask, weight_mask=None, padding_mask=None) -> torch.Tensor:
-        """DDPM 训练步: scheduler.add_noise → epsilon/v-prediction → weighted MSE loss。"""
         if self.noise_offset > 0:
             noise = noise + self.noise_offset * torch.randn(
                 latents.shape[0], latents.shape[1], 1, 1,
@@ -634,9 +590,6 @@ class PixArtSigmaTrainer(BaseTrainer):
             encoder_attention_mask=attention_mask,
         ).sample
 
-        if model_output.shape[1] != latents.shape[1]:
-            model_output, _ = model_output.chunk(2, dim=1)
-
         if self.noise_scheduler.config.prediction_type == "v_prediction":
             target = self.noise_scheduler.get_velocity(latents, noise, timesteps)
         else:
@@ -654,17 +607,7 @@ class PixArtSigmaTrainer(BaseTrainer):
 
     @torch.no_grad()
     def _run_validation(self, val_loop: ValidationLoop, val_gt_images=None):
-        """执行验证生成 + 分布式 FID 计算。
-
-        根据 noise_paradigm 选择推理 scheduler:
-          - flow_matching: FlowMatchEulerDiscreteScheduler
-          - ddpm: DPMSolverMultistepScheduler
-
-        Args:
-            val_gt_images: 训练集 ground truth 图像列表（与 prompts 一一对应），
-                           传入后每次验证自动生成 [生成图 | 训练原图] 对比图。
-        """
-        from diffusers import PixArtSigmaPipeline
+        from diffusers import SanaPipeline
 
         self.transformer.eval()
 
@@ -672,22 +615,23 @@ class PixArtSigmaTrainer(BaseTrainer):
         if hasattr(unwrapped_transformer, "_orig_mod"):
             unwrapped_transformer = unwrapped_transformer._orig_mod
 
-        if self.noise_paradigm == "flow_matching":
-            from diffusers import FlowMatchEulerDiscreteScheduler
-            inference_scheduler = FlowMatchEulerDiscreteScheduler.from_config(
-                self.noise_scheduler.config
-            )
-            from models.model_loader import patch_fm_scheduler_for_pipeline
-            patch_fm_scheduler_for_pipeline(inference_scheduler)
-        else:
-            from diffusers import DPMSolverMultistepScheduler
-            inference_scheduler = DPMSolverMultistepScheduler.from_config(
-                self.noise_scheduler.config,
-                algorithm_type="sde-dpmsolver++",
-                use_karras_sigmas=True,
-            )
+        from diffusers import DPMSolverMultistepScheduler
+        inference_scheduler = DPMSolverMultistepScheduler(
+            num_train_timesteps=1000,
+            beta_start=0.0001,
+            beta_end=0.02,
+            beta_schedule="linear",
+            prediction_type="flow_prediction",
+            use_flow_sigmas=True,
+            flow_shift=float(self.training_cfg.get("scheduler_shift", 3.0)),
+            algorithm_type="dpmsolver++",
+            solver_order=2,
+            solver_type="midpoint",
+            lower_order_final=True,
+            final_sigmas_type="zero",
+        )
 
-        pipeline = PixArtSigmaPipeline(
+        pipeline = SanaPipeline(
             vae=self.vae,
             transformer=unwrapped_transformer,
             text_encoder=None,
@@ -712,40 +656,14 @@ class PixArtSigmaTrainer(BaseTrainer):
 
         pipeline.set_progress_bar_config(disable=True)
 
-        # img2img: 需要支持自定义 timesteps 的 scheduler
-        # DPMSolverMultistep(karras) 不支持 timesteps 参数，img2img 改用 EulerDiscrete
         img2img_data = None
         img2img_sched = None
-        if val_loop.img2img_strengths and val_gt_images:
-            if self.noise_paradigm == "flow_matching":
-                from diffusers import FlowMatchEulerDiscreteScheduler
-                img2img_sched = FlowMatchEulerDiscreteScheduler.from_config(
-                    self.noise_scheduler.config
-                )
-            else:
-                from diffusers import EulerDiscreteScheduler
-                img2img_sched = EulerDiscreteScheduler.from_config(
-                    self.noise_scheduler.config
-                )
-
-            img2img_data = []
-            for strength in val_loop.img2img_strengths:
-                latents, timesteps = self._prepare_img2img_latents(
-                    scheduler=img2img_sched,
-                    images=val_gt_images,
-                    strength=strength,
-                    num_inference_steps=val_loop.num_inference_steps,
-                    device=self.accelerator.device,
-                    seed=val_loop.seed,
-                )
-                img2img_data.append((strength, latents, timesteps))
-            logger.info(f"img2img 数据已准备：{[s for s,_,_ in img2img_data]} strengths × {len(val_gt_images)} 图")
 
         val_loop.run(
             pipeline,
             self.global_step,
             self.tb_logger,
-            device=self.accelerator.device,
+            device=dev,
             accelerator=self.accelerator,
             pipeline_kwargs_override=pipeline_kwargs_override,
             ground_truth_images=val_gt_images,
@@ -756,69 +674,13 @@ class PixArtSigmaTrainer(BaseTrainer):
 
         self.transformer.train()
 
-    @torch.no_grad()
-    def _prepare_img2img_latents(
-        self,
-        scheduler,
-        images: list,
-        strength: float,
-        num_inference_steps: int,
-        device: torch.device,
-        seed: int,
-    ):
-        """将训练图的 clean latent 加噪，供 img2img 验证使用。
-
-        根据 noise_paradigm 选择加噪方式:
-          - flow_matching: 线性插值 z_noisy = t_start * z_clean + (1-t_start) * noise
-          - ddpm: scheduler.add_noise(z_clean, noise, t_start_timestep)
-        """
-        scheduler.set_timesteps(num_inference_steps, device=device)
-        all_timesteps = scheduler.timesteps
-
-        start_idx = max(int(num_inference_steps * (1.0 - strength)), 1)
-        start_idx = min(start_idx, len(all_timesteps) - 1)
-        img2img_timesteps = all_timesteps[start_idx:].tolist()
-
-        cache_dir = Path(self._get_latent_cache_dir())
-        cache_files = sorted(cache_dir.glob("*.pt")) if cache_dir.exists() else []
-
-        latents_list = []
-        for i in range(len(images)):
-            if i < len(cache_files):
-                cached = torch.load(cache_files[i], map_location="cpu", weights_only=False)
-                z_clean = cached["latent"].unsqueeze(0).to(device, dtype=torch.float32)
-            else:
-                import torchvision.transforms.functional as TF
-                img_tensor = TF.to_tensor(images[i]).unsqueeze(0).to(device, dtype=self.vae.dtype)
-                img_tensor = img_tensor * 2.0 - 1.0
-                z_clean = self.vae.encode(img_tensor).latent_dist.sample()
-                z_clean = z_clean * self.vae.config.scaling_factor
-
-            generator = torch.Generator(device=device).manual_seed(seed + i)
-            noise = torch.randn_like(z_clean, generator=generator)
-
-            if self.noise_paradigm == "flow_matching":
-                t_start = 1.0 - strength
-                z_noisy = t_start * z_clean + (1.0 - t_start) * noise
-            else:
-                t_start_ts = all_timesteps[start_idx]
-                z_noisy = self.noise_scheduler.add_noise(
-                    z_clean, noise, torch.tensor([t_start_ts], device=device).long(),
-                )
-
-            latents_list.append(z_noisy.to(dtype=torch.bfloat16))
-
-        return latents_list, img2img_timesteps
-
     def _update_ema_loss(self, loss: float):
-        """更新 loss 的指数移动平均。"""
         if self._ema_loss is None:
             self._ema_loss = loss
         else:
             self._ema_loss = self._ema_decay * self._ema_loss + (1 - self._ema_decay) * loss
 
     def _maybe_save_best(self):
-        """若 EMA loss 为历史最低且距上次保存已过最小间隔，保存 best checkpoint。"""
         if self._ema_loss is None:
             return
         steps_since_last = self.global_step - self._last_best_save_step
@@ -853,10 +715,8 @@ class PixArtSigmaTrainer(BaseTrainer):
                 )
 
     def _save_checkpoint(self, optimizer, lr_scheduler):
-        """保存完整 transformer 权重检查点（仅主进程）。"""
         if not self.accelerator.is_main_process:
             return
-
         self.ckpt_manager.save(
             step=self.global_step,
             global_epoch=self.global_epoch,

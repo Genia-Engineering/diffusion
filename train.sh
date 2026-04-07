@@ -20,6 +20,7 @@
 #   bash train.sh overfitpixart16img                     # PixArt-Sigma 过拟合测试（16张，固定lr）
 #   bash train.sh pixart_cn                              # PixArt-Sigma ControlNet 训练
 #   bash train.sh pixart_cnxs                            # PixArt-Sigma ControlNet-XS 训练
+#   bash train.sh pixart_cnxs_duallr                     # PixArt-Sigma ControlNet-XS 双学习率训练
 #   bash train.sh overfitpixart_cn                       # PixArt-Sigma ControlNet 过拟合测试
 #   bash train.sh pixart_ic                              # PixArt-Sigma 图像条件训练 (VAE 模式，默认)
 #   bash train.sh pixart_ic_overfit                      # PixArt-Sigma 图像条件过拟合测试 (32张)
@@ -81,12 +82,17 @@ while [[ $i -lt ${#args[@]} ]]; do
         overfitpixart16img) TASK="overfitpixart16img" ;;
         pixart_cn)        TASK="pixart_cn"        ;;
         pixart_cnxs)      TASK="pixart_cnxs"      ;;
+        pixart_cnxs_duallr) TASK="pixart_cnxs_duallr" ;;
+        pixart_cn_zero)   TASK="pixart_cn_zero"   ;;
+        pixart_cn_rand)   TASK="pixart_cn_rand"   ;;
         overfitpixart_cn) TASK="overfitpixart_cn" ;;
         pixart_ic)        TASK="pixart_ic"        ;;
         pixart_ic_overfit) TASK="pixart_ic_overfit" ;;
         pixart_ic_dinov2) TASK="pixart_ic_dinov2" ;;
         pixart_ic_clip) TASK="pixart_ic_clip" ;;
         pixart_lora)  TASK="pixart_lora"  ;;
+        sana)         TASK="sana"         ;;
+        sana_lora)    TASK="sana_lora"    ;;
         pixart_ipa)   TASK="pixart_ipa"   ;;
         pixart_ipa_overfit) TASK="pixart_ipa_overfit" ;;
         pixart_native_img2img) TASK="pixart_native_img2img" ;;
@@ -105,7 +111,7 @@ while [[ $i -lt ${#args[@]} ]]; do
             ;;
         *)
             echo "[ERROR] 未知参数: $arg"
-            echo "  支持: lora | controlnet | controlnetxs | pixart | pixart_lora | pixart_cn | pixart_cnxs | pixart_ic | pixart_ic_dinov2 | pixart_ic_clip | pixart_ipa | pixart_ipa_overfit | pixart_native_img2img | pixart_native_img2img_refine | eval_fid | sd15 | sdxl | smoke | overfit | overfitxs | overfitlora | overfitpixart | overfitpixart_cn | zero2 | resume | --config <path>"
+            echo "  支持: lora | controlnet | controlnetxs | pixart | pixart_lora | sana | sana_lora | pixart_cn | pixart_cnxs | pixart_cnxs_duallr | pixart_cn_zero | pixart_cn_rand | pixart_ic | pixart_ic_dinov2 | pixart_ic_clip | pixart_ipa | pixart_ipa_overfit | pixart_native_img2img | pixart_native_img2img_refine | eval_fid | sd15 | sdxl | smoke | overfit | overfitxs | overfitlora | overfitpixart | overfitpixart_cn | zero2 | resume | --config <path>"
             exit 1
             ;;
     esac
@@ -155,12 +161,17 @@ declare -A CONFIG_MAP=(
     ["overfitpixart16img:sdxl"]="configs/overfit_test_pixart_sigma_16img.yaml"
     ["pixart_cn:sdxl"]="configs/controlnet_pixart_sigma.yaml"
     ["pixart_cnxs:sdxl"]="configs/controlnet_xs_pixart_sigma.yaml"
+    ["pixart_cnxs_duallr:sdxl"]="configs/controlnet_xs_pixart_sigma_dual_lr.yaml"
+    ["pixart_cn_zero:sdxl"]="configs/controlnet_zeroconv_pixart_sigma.yaml"
+    ["pixart_cn_rand:sdxl"]="configs/controlnet_randinit_pixart_sigma.yaml"
     ["overfitpixart_cn:sdxl"]="configs/overfit_test_controlnet_pixart_sigma.yaml"
     ["pixart_ic:sdxl"]="configs/pixart_sigma_img_cond_floorplan.yaml"
     ["pixart_ic_overfit:sdxl"]="configs/pixart_sigma_img_cond_overfit.yaml"
     ["pixart_ic_dinov2:sdxl"]="configs/pixart_sigma_img_cond_floorplan.yaml"
     ["pixart_ic_clip:sdxl"]="configs/pixart_sigma_img_cond_floorplan.yaml"
     ["pixart_lora:sdxl"]="configs/lora_pixart_sigma_floorplan.yaml"
+    ["sana:sdxl"]="configs/sana_floorplan.yaml"
+    ["sana_lora:sdxl"]="configs/lora_sana_floorplan.yaml"
     ["pixart_ipa:sdxl"]="configs/pixart_sigma_ip_adapter.yaml"
     ["pixart_ipa_overfit:sdxl"]="configs/pixart_sigma_ip_adapter_overfit.yaml"
     ["pixart_native_img2img:sdxl"]="configs/pixart_sigma_native_img2img.yaml"
@@ -181,12 +192,17 @@ declare -A SCRIPT_MAP=(
     ["overfitpixart16img"]="scripts/train_pixart_sigma.py"
     ["pixart_cn"]="scripts/train_pixart_controlnet.py"
     ["pixart_cnxs"]="scripts/train_pixart_controlnet_xs.py"
+    ["pixart_cnxs_duallr"]="scripts/train_pixart_controlnet_xs.py"
+    ["pixart_cn_zero"]="scripts/train_pixart_controlnet.py"
+    ["pixart_cn_rand"]="scripts/train_pixart_controlnet.py"
     ["overfitpixart_cn"]="scripts/train_pixart_controlnet.py"
     ["pixart_ic"]="scripts/train_pixart_img_cond.py"
     ["pixart_ic_overfit"]="scripts/train_pixart_img_cond.py"
     ["pixart_ic_dinov2"]="scripts/train_pixart_img_cond.py"
     ["pixart_ic_clip"]="scripts/train_pixart_img_cond.py"
     ["pixart_lora"]="scripts/train_pixart_lora.py"
+    ["sana"]="scripts/train_sana.py"
+    ["sana_lora"]="scripts/train_sana_lora.py"
     ["pixart_ipa"]="scripts/train_pixart_ip_adapter.py"
     ["pixart_ipa_overfit"]="scripts/train_pixart_ip_adapter.py"
     ["pixart_native_img2img"]="scripts/train_pixart_native_img2img.py"
@@ -217,6 +233,12 @@ elif [[ "$TASK" == "pixart_cn" ]]; then
     KEY="pixart_cn:sdxl"
 elif [[ "$TASK" == "pixart_cnxs" ]]; then
     KEY="pixart_cnxs:sdxl"
+elif [[ "$TASK" == "pixart_cnxs_duallr" ]]; then
+    KEY="pixart_cnxs_duallr:sdxl"
+elif [[ "$TASK" == "pixart_cn_zero" ]]; then
+    KEY="pixart_cn_zero:sdxl"
+elif [[ "$TASK" == "pixart_cn_rand" ]]; then
+    KEY="pixart_cn_rand:sdxl"
 elif [[ "$TASK" == "overfitpixart_cn" ]]; then
     KEY="overfitpixart_cn:sdxl"
 elif [[ "$TASK" == "pixart_ic" ]]; then
@@ -229,6 +251,10 @@ elif [[ "$TASK" == "pixart_ic_clip" ]]; then
     KEY="pixart_ic_clip:sdxl"
 elif [[ "$TASK" == "pixart_lora" ]]; then
     KEY="pixart_lora:sdxl"
+elif [[ "$TASK" == "sana" ]]; then
+    KEY="sana:sdxl"
+elif [[ "$TASK" == "sana_lora" ]]; then
+    KEY="sana_lora:sdxl"
 elif [[ "$TASK" == "pixart_ipa" ]]; then
     KEY="pixart_ipa:sdxl"
 elif [[ "$TASK" == "pixart_ipa_overfit" ]]; then
@@ -242,7 +268,7 @@ fi
 TRAIN_SCRIPT="${SCRIPT_MAP[$TASK]:-}"
 if [[ -z "$TRAIN_SCRIPT" ]]; then
     echo "[ERROR] 不支持的任务类型: ${TASK}"
-    echo "  支持: lora | controlnet | controlnetxs | pixart | pixart_lora | pixart_cn | pixart_cnxs | pixart_ic | pixart_ic_dinov2 | pixart_ic_clip | pixart_ipa | pixart_ipa_overfit | eval_fid | smoke | overfit | overfitxs | overfitlora | overfitpixart | overfitpixart_cn | cache"
+    echo "  支持: lora | controlnet | controlnetxs | pixart | pixart_lora | pixart_cn | pixart_cnxs | pixart_cnxs_duallr | pixart_ic | pixart_ic_dinov2 | pixart_ic_clip | pixart_ipa | pixart_ipa_overfit | eval_fid | smoke | overfit | overfitxs | overfitlora | overfitpixart | overfitpixart_cn | cache"
     exit 1
 fi
 
@@ -283,7 +309,7 @@ else
     CONFIG="${CONFIG_MAP[$KEY]:-}"
     if [[ -z "$CONFIG" ]]; then
         echo "[ERROR] 不支持的组合: task=${TASK} model=${MODEL_TYPE}"
-        echo "  支持: lora×{sd15,sdxl}, controlnet×{sd15,sdxl}, controlnetxs×sdxl, pixart, pixart_lora, pixart_cn, pixart_cnxs, pixart_ic, pixart_ic_dinov2, pixart_ic_clip, pixart_ipa, pixart_ipa_overfit, smoke, overfit, overfitxs, overfitlora, overfitpixart, overfitpixart_cn"
+        echo "  支持: lora×{sd15,sdxl}, controlnet×{sd15,sdxl}, controlnetxs×sdxl, pixart, pixart_lora, pixart_cn, pixart_cnxs, pixart_cnxs_duallr, pixart_ic, pixart_ic_dinov2, pixart_ic_clip, pixart_ipa, pixart_ipa_overfit, smoke, overfit, overfitxs, overfitlora, overfitpixart, overfitpixart_cn"
         echo "  或使用 --config <path> 指定自定义配置文件"
         exit 1
     fi
@@ -317,6 +343,15 @@ else
     elif [[ "$TASK" == "pixart_cnxs" ]]; then
         SESSION="pixart_cnxs_train"
         LOG_FILE="${PROJ_DIR}/logs/train_pixart_cnxs.log"
+    elif [[ "$TASK" == "pixart_cnxs_duallr" ]]; then
+        SESSION="pixart_cnxs_duallr_train"
+        LOG_FILE="${PROJ_DIR}/logs/train_pixart_cnxs_duallr.log"
+    elif [[ "$TASK" == "pixart_cn_zero" ]]; then
+        SESSION="pixart_cn_zero_train"
+        LOG_FILE="${PROJ_DIR}/logs/train_pixart_cn_zero.log"
+    elif [[ "$TASK" == "pixart_cn_rand" ]]; then
+        SESSION="pixart_cn_rand_train"
+        LOG_FILE="${PROJ_DIR}/logs/train_pixart_cn_rand.log"
     elif [[ "$TASK" == "overfitpixart_cn" ]]; then
         SESSION="pixart_cn_overfit_test"
         LOG_FILE="${PROJ_DIR}/logs/train_overfit_pixart_cn.log"
@@ -335,6 +370,12 @@ else
     elif [[ "$TASK" == "pixart_lora" ]]; then
         SESSION="pixart_lora_train"
         LOG_FILE="${PROJ_DIR}/logs/train_pixart_lora.log"
+    elif [[ "$TASK" == "sana" ]]; then
+        SESSION="sana_train"
+        LOG_FILE="${PROJ_DIR}/logs/train_sana.log"
+    elif [[ "$TASK" == "sana_lora" ]]; then
+        SESSION="sana_lora_train"
+        LOG_FILE="${PROJ_DIR}/logs/train_sana_lora.log"
     elif [[ "$TASK" == "pixart_ipa" ]]; then
         SESSION="pixart_ipa_train"
         LOG_FILE="${PROJ_DIR}/logs/train_pixart_ipa.log"

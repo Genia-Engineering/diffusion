@@ -317,6 +317,7 @@ class PixArtControlNetPipeline(DiffusionPipeline):
             latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
 
         if output_type != "latent":
+            latents = latents.to(self.vae.dtype)
             image_output = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
             image_output = self.image_processor.postprocess(image_output, output_type=output_type)
         else:

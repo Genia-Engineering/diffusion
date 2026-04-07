@@ -28,7 +28,7 @@ from PIL import Image
 from torch.utils.data import Dataset
 
 from .dataset import BaseImageDataset, IMAGE_EXTENSIONS
-from .transforms import AspectRatioResize, apply_transforms, build_transforms
+from .transforms import AspectRatioPad, AspectRatioResize, apply_transforms, build_transforms
 
 logger = logging.getLogger(__name__)
 
@@ -371,6 +371,8 @@ class PixArtControlNetCachedLatentDataset(BaseImageDataset):
         t5_max_length: int = 300,
         max_train_samples: int | None = None,
         text_embed_cache_dir: str | None = None,
+        use_bucketing: bool = True,
+        pad_color: tuple[int, ...] = (0, 0, 0),
     ):
         super().__init__(
             data_dir, resolution=1024, center_crop=False, random_flip=False,
@@ -381,6 +383,8 @@ class PixArtControlNetCachedLatentDataset(BaseImageDataset):
         self.center_crop = center_crop
         self.do_random_flip = random_flip
         self.conditioning_type = conditioning_type
+        self.use_bucketing = use_bucketing
+        self.pad_color = tuple(pad_color)
 
         # 条件图像索引（像素模式或 latent 回退时使用）
         self.conditioning_dir = Path(conditioning_data_dir) if conditioning_data_dir else None
@@ -485,6 +489,19 @@ class PixArtControlNetCachedLatentDataset(BaseImageDataset):
                 "attention_mask": self.cached_attention_mask.clone(),
             }
 
+        # padding_mask: 非分桶模式下，目标 latent 预计算时已保存
+        padding_mask = data.get("padding_mask", None)
+        if padding_mask is not None:
+            padding_mask = torch.flip(padding_mask, dims=[-1]) if use_flip else padding_mask
+            result["padding_mask"] = padding_mask.float()
+
+        # orig_max_channel: 辅助结构 loss 使用的预缓存二值 mask
+        if "orig_max_channel" in data:
+            omc = data["orig_max_channel"].float()
+            if use_flip:
+                omc = omc.flip(-1)
+            result["orig_max_channel"] = omc
+
         # 条件数据
         if self.conditioning_mode == "vae" and self.conditioning_latent_cache_dir is not None:
             base_key = self._get_base_key(idx)
@@ -494,8 +511,12 @@ class PixArtControlNetCachedLatentDataset(BaseImageDataset):
             result["conditioning_latents"] = cond_latent.float()
         else:
             cond_image = self._load_conditioning_image(idx)
-            resizer = AspectRatioResize(target_size, center_crop=self.center_crop)
-            cond_image = resizer(cond_image)
+            if self.use_bucketing:
+                resizer = AspectRatioResize(target_size, center_crop=self.center_crop)
+                cond_image = resizer(cond_image)
+            else:
+                padder = AspectRatioPad(target_size, pad_color=self.pad_color)
+                cond_image, _cond_mask = padder(cond_image)
             if use_flip:
                 cond_image = TF.hflip(cond_image)
             cond_tensor = T.ToTensor()(cond_image)  # [0, 1]

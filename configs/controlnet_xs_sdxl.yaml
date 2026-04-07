@@ -7,13 +7,23 @@
 #   - 显存占用: 减少 ~45%
 #   - 单次联合前向传播，无需分别调用 controlnet + unet
 #
-# 数据集 ~3400，batch_size=2，grad_accum=4
-# 425 opt_step/epoch × 40 epoch = 17000 step
+# ── 训练模式 (通过 controlnet.train_unet 切换) ─────────────
 #
-# 显存估算 (per GPU, A10G 23GB):
-#   UNetControlNetXSModel(bf16) ~5.5GB + VAE(bf32) ~0.3GB
-#   + TE1-CLIP-L(frozen) ~0.25GB + TE2-OpenCLIP-G(frozen) ~1.4GB
-#   + Activations(梯度检查点+SDPA) ~6GB ≈ 13-14GB
+#  train_unet: false → 仅训练 XS Adapter, 冻结 base UNet
+#    参数量: ~172M 可训练
+#    推荐 lr: 2e-4
+#    显存: ~20GB (fp32 master weights, 8-bit Adam, gc=ON, batch=8)
+#
+#  train_unet: true  → 全参微调 (base UNet + XS Adapter)
+#    参数量: ~2.6B + ~172M 全部可训练
+#    推荐 lr: 1e-5 (UNet), 可选 controlnet_lr: 1e-4 (XS Adapter)
+#    可通过 pretrained_controlnet_path 加载预训练 adapter 权重
+#    显存: ~35GB (fp32 master weights, 8-bit Adam, gc=ON, batch=8)
+#
+# 典型工作流:
+#   1. 先以 train_unet=false 训练 XS Adapter 至收敛
+#   2. 设置 pretrained_controlnet_path 指向步骤1的 checkpoint
+#   3. 切换 train_unet=true 进行全参微调（低 lr 精调 UNet）
 #
 # 启动方式:
 #   bash train.sh controlnetxs sdxl              # 标准多卡
@@ -27,22 +37,41 @@ model:
   pretrained_model_name_or_path: "stabilityai/stable-diffusion-xl-base-1.0"
   model_type: "sdxl"
   weights_dir: "/home/daiqing_tan/stable_diffusion_lora/weights"
+  # 微调后的 UNet 权重路径（可选）
+  # 设置后将用融合 LoRA 后的 UNet 初始化 base model
+  # 注释掉或留空则使用原始预训练权重
   merged_unet_path: "/home/daiqing_tan/stable_diffusion_lora/outputs/lora_sdxl_floorplan/merged_step_000810"
 
 controlnet:
   conditioning_type: "precomputed"
   conditioning_channels: 3
 
+  # ── 训练模式 ──
+  # true  = 全参微调: base UNet + XS Adapter 均可训练
+  # false = 冻结 base UNet, 仅训练 XS Adapter (~48M, ~1% of base)
+  train_unet: false
+
+  # ── 预训练 ControlNet-XS adapter 权重（可选）──
+  # 指向之前训练的 checkpoint 目录（含 controlnet/ 子目录），
+  # 或直接指向 controlnet/ 目录本身。
+  # 设置后加载预训练 adapter 权重再进行训练（全参微调或继续 adapter-only）。
+  # pretrained_controlnet_path: "./outputs/controlnet_xs_sdxl/checkpoints/step_001200"
+
+  # ── ControlNet 独立学习率（可选，仅 train_unet=true 时生效）──
+  # 设置后 XS Adapter 使用此 lr，base UNet 使用 training.learning_rate
+  # 注释掉或设为 0 则 UNet 和 XS Adapter 共享同一 learning_rate
+  controlnet_lr: 1.0e-4
+
 controlnet_xs:
-  size_ratio: 0.2                  # adapter / base 参数比例；SDXL 下 0.1 ≈ 48M adapter
+  size_ratio: 0.3                  # adapter / base 参数比例；SDXL 下 0.1 ≈ 48M adapter
   no_ctrl_cross_attention: false    # 移除 ctrl 分支的 cross-attention，仅保留 ResNet
                                    # ctrl 不再直接处理文本嵌入，文本语义通过 base→ctrl 投射间接传递
                                    # 与 PixArt-Sigma XS 设计一致
 
 training:
   output_dir: "./outputs/controlnet_xs_sdxl"
-  num_train_steps: 1500
-  learning_rate: 2.0e-4
+  num_train_steps: 3600
+  learning_rate: 1.0e-4
   train_batch_size: 8
   gradient_accumulation_steps: 4
   mixed_precision: "bf16"
@@ -50,9 +79,9 @@ training:
   latent_cache_batch_size: 16
   cache_text_embeddings: true
 
-  validation_steps: 200
-  save_steps: 200
-  keep_last_n_checkpoints: 15
+  validation_steps: 300
+  save_steps: 300
+  keep_last_n_checkpoints: 8
   lr_warmup_steps: 100
 
   gradient_checkpointing: true
@@ -65,13 +94,14 @@ training:
   huber_delta: 0.1
   noise_offset: 0.1
   min_snr_gamma: 5.0
+  caption_dropout_rate: 0.1
 
 data:
   train_data_dir: "/home/daiqing_tan/stable_diffusion_lora/data/data/size_1024/floor"
   conditioning_data_dir: "/home/daiqing_tan/stable_diffusion_lora/data/data/size_1024_controlnet/floor"
   resolution: 1024
   caption: "architectural floor plan, blueprint, technical drawing"
-  use_aspect_ratio_bucketing: true
+  use_aspect_ratio_bucketing: false
   center_crop: false
   random_flip: true
 
@@ -86,6 +116,9 @@ validation:
 
   # caption_mode=fixed 或 prompt_source=config 时使用
   prompts:
+    - "architectural floor plan, blueprint, technical drawing"
+    - "architectural floor plan, blueprint, technical drawing"
+    - "architectural floor plan, blueprint, technical drawing"
     - "architectural floor plan, blueprint, technical drawing"
 
   negative_prompt: "blurry, noisy, low quality, photo"
@@ -121,7 +154,7 @@ validation:
 #         VAE 不更新权重，仅作为梯度传导的桥梁。
 #
 auxiliary_loss:
-  enabled: true
+  enabled: false
   weight: 0.003                    # total_loss = diffusion_loss + weight × aux_loss
   timestep_threshold: 500        # 所有 timestep 均计算 (t_quality 线性衰减自动降权高 t)
   fg_threshold: 0.1               # 前景判定阈值 (归一化 [0,1] 后, 背景≈0, 前景>0.1)

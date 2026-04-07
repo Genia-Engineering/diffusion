@@ -69,18 +69,31 @@ class BaseTrainer(ABC):
         self.loss_type: str = self.training_cfg.get("loss_type", "mse")
         self.huber_delta: float = float(self.training_cfg.get("huber_delta", 0.1))
 
-    def setup_optimizer(self, trainable_params, text_encoder_params=None) -> torch.optim.Optimizer:
-        """配置优化器 — 支持 8-bit AdamW 和分组学习率。"""
+    def setup_optimizer(
+        self,
+        trainable_params=None,
+        text_encoder_params=None,
+        param_groups=None,
+    ) -> torch.optim.Optimizer:
+        """配置优化器 — 支持 8-bit AdamW 和分组学习率。
+
+        Args:
+            trainable_params: 可训练参数列表（与 param_groups 互斥）
+            text_encoder_params: 文本编码器参数（可选第二组，使用 text_encoder_lr）
+            param_groups: 自定义参数组 [{"params": [...], "lr": float}, ...]，
+                          传入时忽略 trainable_params / text_encoder_params
+        """
         use_8bit = self.training_cfg.get("use_8bit_adam", True)
         lr = float(self.training_cfg.learning_rate)
-        te_lr = float(
-            self.training_cfg.get("projector_lr",
-                self.config.get("lora", {}).get("text_encoder_lr", lr))
-        )
 
-        param_groups = [{"params": trainable_params, "lr": lr}]
-        if text_encoder_params:
-            param_groups.append({"params": text_encoder_params, "lr": te_lr})
+        if param_groups is None:
+            te_lr = float(
+                self.training_cfg.get("projector_lr",
+                    self.config.get("lora", {}).get("text_encoder_lr", lr))
+            )
+            param_groups = [{"params": trainable_params, "lr": lr}]
+            if text_encoder_params:
+                param_groups.append({"params": text_encoder_params, "lr": te_lr})
 
         is_deepspeed = (
             hasattr(self.accelerator.state, "deepspeed_plugin")
@@ -285,13 +298,13 @@ class BaseTrainer(ABC):
             if self.accelerator.is_main_process:
                 cache_dir.mkdir(parents=True, exist_ok=True)
 
-            if self.model_type == "pixart_sigma":
-                t5_max_len = 300
+            if self.model_type in ("pixart_sigma", "sana"):
+                max_seq_len = 300
 
-                def _encode_pixart(text):
+                def _encode_seq2seq(text):
                     tokenized = self.tokenizer(
                         text, padding="max_length", truncation=True,
-                        max_length=t5_max_len, return_tensors="pt",
+                        max_length=max_seq_len, return_tensors="pt",
                     )
                     ids = tokenized.input_ids.to(device)
                     attn_mask = tokenized.attention_mask.to(device)
@@ -299,8 +312,8 @@ class BaseTrainer(ABC):
                         embeds = self.text_encoder(ids, attention_mask=attn_mask)[0]
                     return embeds, attn_mask
 
-                embeds, attn_mask = _encode_pixart(caption)
-                neg_embeds, neg_attn_mask = _encode_pixart(neg_prompt)
+                embeds, attn_mask = _encode_seq2seq(caption)
+                neg_embeds, neg_attn_mask = _encode_seq2seq(neg_prompt)
 
                 self._cached_prompt_embeds = embeds
                 self._cached_prompt_attention_mask = attn_mask
@@ -441,12 +454,12 @@ class BaseTrainer(ABC):
 
         val_embeds_list = []
 
-        if self.model_type == "pixart_sigma":
-            t5_max_len = 300
+        if self.model_type in ("pixart_sigma", "sana"):
+            max_seq_len = 300
             for vp in val_prompts:
                 tokenized = self.tokenizer(
                     vp, padding="max_length", truncation=True,
-                    max_length=t5_max_len, return_tensors="pt",
+                    max_length=max_seq_len, return_tensors="pt",
                 )
                 ids = tokenized.input_ids.to(device)
                 attn_mask = tokenized.attention_mask.to(device)
@@ -495,14 +508,19 @@ class BaseTrainer(ABC):
     def _get_text_embed_per_image_cache_dir(self) -> str:
         """返回逐图片文本嵌入缓存目录。
 
-        优先级: training.text_embed_cache_dir → {train_data_dir}/../text_embed_per_image_cache
+        优先级: training.text_embed_cache_dir
+               → {train_data_dir}/../text_embed_per_image_cache_{model_type}
+
+        目录名包含 model_type 以避免不同文本编码器（如 T5-XXL 4096d vs Gemma2 2304d）
+        产生的嵌入维度不同导致缓存冲突。
         """
         explicit = self.training_cfg.get("text_embed_cache_dir", None)
         if explicit:
             return explicit
         data_dir = self.config.data.get("train_data_dir", "./data")
         parent = os.path.dirname(os.path.normpath(data_dir))
-        return os.path.join(parent, "text_embed_per_image_cache")
+        model_type = getattr(self, "model_type", "default")
+        return os.path.join(parent, f"text_embed_per_image_cache_{model_type}")
 
     def _per_image_text_embed_cache_exists(self, cache_dir: str) -> bool:
         return (Path(cache_dir) / ".precompute_done").exists()
@@ -996,9 +1014,18 @@ class BaseTrainer(ABC):
                             batch_t_flip = torch.stack(imgs_flip).to(device)
 
                             with torch.no_grad():
-                                latents = self.vae.encode(batch_t).latent_dist.mode()
+                                enc_out = self.vae.encode(batch_t)
+                                if hasattr(enc_out, "latent_dist"):
+                                    latents = enc_out.latent_dist.mode()
+                                else:
+                                    latents = enc_out.latent
                                 latents = (latents * self.vae.config.scaling_factor).to(torch.float16).cpu()
-                                latents_flip = self.vae.encode(batch_t_flip).latent_dist.mode()
+
+                                enc_out_flip = self.vae.encode(batch_t_flip)
+                                if hasattr(enc_out_flip, "latent_dist"):
+                                    latents_flip = enc_out_flip.latent_dist.mode()
+                                else:
+                                    latents_flip = enc_out_flip.latent
                                 latents_flip = (latents_flip * self.vae.config.scaling_factor).to(torch.float16).cpu()
 
                             latent_h, latent_w = latents.shape[-2], latents.shape[-1]
@@ -1076,6 +1103,12 @@ class BaseTrainer(ABC):
             del self.vae.encoder
         if hasattr(self.vae, "quant_conv"):
             del self.vae.quant_conv
+        if hasattr(self.vae, "encoder_conv_in"):
+            del self.vae.encoder_conv_in
+        if hasattr(self.vae, "encoder_stages"):
+            del self.vae.encoder_stages
+        if hasattr(self.vae, "encoder_conv_out"):
+            del self.vae.encoder_conv_out
         torch.cuda.empty_cache()
         logger.info(f"[Rank {process_index}] VAE encoder 已卸载（保留 decoder 供 validation 使用）")
 
