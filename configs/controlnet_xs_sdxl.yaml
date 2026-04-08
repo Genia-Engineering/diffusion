@@ -40,7 +40,7 @@ model:
   # 微调后的 UNet 权重路径（可选）
   # 设置后将用融合 LoRA 后的 UNet 初始化 base model
   # 注释掉或留空则使用原始预训练权重
-  merged_unet_path: "/home/daiqing_tan/stable_diffusion_lora/outputs/lora_sdxl_floorplan/merged_step_000810"
+  merged_unet_path: "/home/daiqing_tan/stable_diffusion_lora/outputs/lora_sdxl/merged_step_000810"
 
 controlnet:
   conditioning_type: "precomputed"
@@ -55,7 +55,7 @@ controlnet:
   # 指向之前训练的 checkpoint 目录（含 controlnet/ 子目录），
   # 或直接指向 controlnet/ 目录本身。
   # 设置后加载预训练 adapter 权重再进行训练（全参微调或继续 adapter-only）。
-  pretrained_controlnet_path: "./outputs/controlnet_xs_sdxl/checkpoints/step_010000"
+  # pretrained_controlnet_path: ""  # 上轮 checkpoint 已删除，从随机初始化开始
 
   # ── ControlNet 独立学习率（可选，仅 train_unet=true 时生效）──
   # 设置后 XS Adapter 使用此 lr，base UNet 使用 training.learning_rate
@@ -70,7 +70,7 @@ controlnet_xs:
 
 training:
   output_dir: "./outputs/controlnet_xs_sdxl_finetune"
-  num_train_steps: 10000
+  num_train_steps: 5000
   learning_rate: 1.0e-5            # base UNet 用低 lr
   train_batch_size: 4              # 全参微调显存翻倍，batch 减半
   gradient_accumulation_steps: 8   # 保持 effective batch = 32
