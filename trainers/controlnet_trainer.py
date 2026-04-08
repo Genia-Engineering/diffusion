@@ -282,6 +282,8 @@ class ControlNetTrainer(BaseTrainer):
         fixed_caption = data_cfg.get("caption", "")
         cache_latents = self.training_cfg.get("cache_latents", False)
         max_train_samples = data_cfg.get("max_train_samples", None)
+        use_bucketing = data_cfg.get("use_aspect_ratio_bucketing", True)
+        pad_color = tuple(data_cfg.get("pad_color", [0, 0, 0]))
 
         if cache_latents:
             dataset = CachedLatentControlNetDataset(
@@ -295,6 +297,8 @@ class ControlNetTrainer(BaseTrainer):
                 random_flip=data_cfg.get("random_flip", True),
                 fixed_caption=fixed_caption,
                 max_train_samples=max_train_samples,
+                use_bucketing=use_bucketing,
+                pad_color=pad_color,
             )
         else:
             dataset = ControlNetDataset(
@@ -310,7 +314,7 @@ class ControlNetTrainer(BaseTrainer):
                 max_train_samples=max_train_samples,
             )
 
-        if cache_latents or data_cfg.get("use_aspect_ratio_bucketing", True):
+        if use_bucketing:
             bucket_manager = BucketManager(model_type=self.model_type)
             image_sizes = dataset.get_image_sizes()
             bucket_to_indices = bucket_manager.assign_buckets(image_sizes)
@@ -324,6 +328,10 @@ class ControlNetTrainer(BaseTrainer):
                 collate_fn=_safe_collate,
             )
         else:
+            logger.info(
+                f"分桶已关闭，所有图片 pad 至 {resolution}×{resolution}，"
+                f"控制图同步 pad，使用标准 shuffle DataLoader"
+            )
             dataloader = DataLoader(
                 dataset, batch_size=batch_size, shuffle=True,
                 num_workers=self.training_cfg.get("dataloader_num_workers", 4),

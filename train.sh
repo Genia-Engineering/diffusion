@@ -21,6 +21,7 @@
 #   bash train.sh pixart_cn                              # PixArt-Sigma ControlNet 训练
 #   bash train.sh pixart_cnxs                            # PixArt-Sigma ControlNet-XS 训练
 #   bash train.sh pixart_cnxs_duallr                     # PixArt-Sigma ControlNet-XS 双学习率训练
+#   bash train.sh pixart_cnxs_adapter                    # PixArt-Sigma ControlNet-XS 仅 Adapter 训练
 #   bash train.sh overfitpixart_cn                       # PixArt-Sigma ControlNet 过拟合测试
 #   bash train.sh pixart_ic                              # PixArt-Sigma 图像条件训练 (VAE 模式，默认)
 #   bash train.sh pixart_ic_overfit                      # PixArt-Sigma 图像条件过拟合测试 (32张)
@@ -83,6 +84,7 @@ while [[ $i -lt ${#args[@]} ]]; do
         pixart_cn)        TASK="pixart_cn"        ;;
         pixart_cnxs)      TASK="pixart_cnxs"      ;;
         pixart_cnxs_duallr) TASK="pixart_cnxs_duallr" ;;
+        pixart_cnxs_adapter) TASK="pixart_cnxs_adapter" ;;
         pixart_cn_zero)   TASK="pixart_cn_zero"   ;;
         pixart_cn_rand)   TASK="pixart_cn_rand"   ;;
         overfitpixart_cn) TASK="overfitpixart_cn" ;;
@@ -111,7 +113,7 @@ while [[ $i -lt ${#args[@]} ]]; do
             ;;
         *)
             echo "[ERROR] 未知参数: $arg"
-            echo "  支持: lora | controlnet | controlnetxs | pixart | pixart_lora | sana | sana_lora | pixart_cn | pixart_cnxs | pixart_cnxs_duallr | pixart_cn_zero | pixart_cn_rand | pixart_ic | pixart_ic_dinov2 | pixart_ic_clip | pixart_ipa | pixart_ipa_overfit | pixart_native_img2img | pixart_native_img2img_refine | eval_fid | sd15 | sdxl | smoke | overfit | overfitxs | overfitlora | overfitpixart | overfitpixart_cn | zero2 | resume | --config <path>"
+            echo "  支持: lora | controlnet | controlnetxs | pixart | pixart_lora | sana | sana_lora | pixart_cn | pixart_cnxs | pixart_cnxs_duallr | pixart_cnxs_adapter | pixart_cn_zero | pixart_cn_rand | pixart_ic | pixart_ic_dinov2 | pixart_ic_clip | pixart_ipa | pixart_ipa_overfit | pixart_native_img2img | pixart_native_img2img_refine | eval_fid | sd15 | sdxl | smoke | overfit | overfitxs | overfitlora | overfitpixart | overfitpixart_cn | zero2 | resume | --config <path>"
             exit 1
             ;;
     esac
@@ -170,6 +172,7 @@ declare -A CONFIG_MAP=(
     ["pixart_cn:sdxl"]="configs/controlnet_pixart_sigma.yaml"
     ["pixart_cnxs:sdxl"]="configs/controlnet_xs_pixart_sigma.yaml"
     ["pixart_cnxs_duallr:sdxl"]="configs/controlnet_xs_pixart_sigma_dual_lr.yaml"
+    ["pixart_cnxs_adapter:sdxl"]="configs/controlnet_xs_pixart_sigma_adapter_only.yaml"
     ["pixart_cn_zero:sdxl"]="configs/controlnet_zeroconv_pixart_sigma.yaml"
     ["pixart_cn_rand:sdxl"]="configs/controlnet_randinit_pixart_sigma.yaml"
     ["overfitpixart_cn:sdxl"]="configs/overfit_test_controlnet_pixart_sigma.yaml"
@@ -201,6 +204,7 @@ declare -A SCRIPT_MAP=(
     ["pixart_cn"]="scripts/train_pixart_controlnet.py"
     ["pixart_cnxs"]="scripts/train_pixart_controlnet_xs.py"
     ["pixart_cnxs_duallr"]="scripts/train_pixart_controlnet_xs.py"
+    ["pixart_cnxs_adapter"]="scripts/train_pixart_controlnet_xs.py"
     ["pixart_cn_zero"]="scripts/train_pixart_controlnet.py"
     ["pixart_cn_rand"]="scripts/train_pixart_controlnet.py"
     ["overfitpixart_cn"]="scripts/train_pixart_controlnet.py"
@@ -243,6 +247,8 @@ elif [[ "$TASK" == "pixart_cnxs" ]]; then
     KEY="pixart_cnxs:sdxl"
 elif [[ "$TASK" == "pixart_cnxs_duallr" ]]; then
     KEY="pixart_cnxs_duallr:sdxl"
+elif [[ "$TASK" == "pixart_cnxs_adapter" ]]; then
+    KEY="pixart_cnxs_adapter:sdxl"
 elif [[ "$TASK" == "pixart_cn_zero" ]]; then
     KEY="pixart_cn_zero:sdxl"
 elif [[ "$TASK" == "pixart_cn_rand" ]]; then
@@ -276,7 +282,7 @@ fi
 TRAIN_SCRIPT="${SCRIPT_MAP[$TASK]:-}"
 if [[ -z "$TRAIN_SCRIPT" ]]; then
     echo "[ERROR] 不支持的任务类型: ${TASK}"
-    echo "  支持: lora | controlnet | controlnetxs | pixart | pixart_lora | pixart_cn | pixart_cnxs | pixart_cnxs_duallr | pixart_ic | pixart_ic_dinov2 | pixart_ic_clip | pixart_ipa | pixart_ipa_overfit | eval_fid | smoke | overfit | overfitxs | overfitlora | overfitpixart | overfitpixart_cn | cache"
+    echo "  支持: lora | controlnet | controlnetxs | pixart | pixart_lora | pixart_cn | pixart_cnxs | pixart_cnxs_duallr | pixart_cnxs_adapter | pixart_ic | pixart_ic_dinov2 | pixart_ic_clip | pixart_ipa | pixart_ipa_overfit | eval_fid | smoke | overfit | overfitxs | overfitlora | overfitpixart | overfitpixart_cn | cache"
     exit 1
 fi
 
@@ -317,7 +323,7 @@ else
     CONFIG="${CONFIG_MAP[$KEY]:-}"
     if [[ -z "$CONFIG" ]]; then
         echo "[ERROR] 不支持的组合: task=${TASK} model=${MODEL_TYPE}"
-        echo "  支持: lora×{sd15,sdxl}, controlnet×{sd15,sdxl}, controlnetxs×sdxl, pixart, pixart_lora, pixart_cn, pixart_cnxs, pixart_cnxs_duallr, pixart_ic, pixart_ic_dinov2, pixart_ic_clip, pixart_ipa, pixart_ipa_overfit, smoke, overfit, overfitxs, overfitlora, overfitpixart, overfitpixart_cn"
+        echo "  支持: lora×{sd15,sdxl}, controlnet×{sd15,sdxl}, controlnetxs×sdxl, pixart, pixart_lora, pixart_cn, pixart_cnxs, pixart_cnxs_duallr, pixart_cnxs_adapter, pixart_ic, pixart_ic_dinov2, pixart_ic_clip, pixart_ipa, pixart_ipa_overfit, smoke, overfit, overfitxs, overfitlora, overfitpixart, overfitpixart_cn"
         echo "  或使用 --config <path> 指定自定义配置文件"
         exit 1
     fi
@@ -354,6 +360,9 @@ else
     elif [[ "$TASK" == "pixart_cnxs_duallr" ]]; then
         SESSION="pixart_cnxs_duallr_train"
         LOG_FILE="${PROJ_DIR}/logs/train_pixart_cnxs_duallr.log"
+    elif [[ "$TASK" == "pixart_cnxs_adapter" ]]; then
+        SESSION="pixart_cnxs_adapter_train"
+        LOG_FILE="${PROJ_DIR}/logs/train_pixart_cnxs_adapter.log"
     elif [[ "$TASK" == "pixart_cn_zero" ]]; then
         SESSION="pixart_cn_zero_train"
         LOG_FILE="${PROJ_DIR}/logs/train_pixart_cn_zero.log"

@@ -416,6 +416,13 @@ class PixArtControlNetXSTransformerModel(ModelMixin, ConfigMixin):
                 "`added_cond_kwargs` cannot be None when using additional conditions for `adaln_single`."
             )
 
+        model_dtype = next(self.transformer.parameters()).dtype
+        hidden_states = hidden_states.to(dtype=model_dtype)
+        if encoder_hidden_states is not None:
+            encoder_hidden_states = encoder_hidden_states.to(dtype=model_dtype)
+        if controlnet_cond is not None:
+            controlnet_cond = controlnet_cond.to(dtype=model_dtype)
+
         # --- Attention mask → bias ---
         if attention_mask is not None and attention_mask.ndim == 2:
             attention_mask = (1 - attention_mask.to(hidden_states.dtype)) * -10000.0

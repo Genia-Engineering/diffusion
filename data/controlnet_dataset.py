@@ -226,12 +226,16 @@ class CachedLatentControlNetDataset(BaseImageDataset):
         tokenizer_2=None,
         fixed_caption: str = "",
         max_train_samples: int | None = None,
+        use_bucketing: bool = True,
+        pad_color: tuple[int, ...] = (0, 0, 0),
     ):
         super().__init__(data_dir, resolution=1024, center_crop=False, random_flip=False, max_train_samples=max_train_samples)
         self.cache_dir = Path(cache_dir)
         self.center_crop = center_crop
         self.do_random_flip = random_flip
         self.conditioning_type = conditioning_type
+        self.use_bucketing = use_bucketing
+        self.pad_color = tuple(pad_color)
 
         self.conditioning_dir = Path(conditioning_data_dir) if conditioning_data_dir else None
         self.online_extract = self.conditioning_dir is None or not self.conditioning_dir.exists()
@@ -312,10 +316,14 @@ class CachedLatentControlNetDataset(BaseImageDataset):
         target_h, target_w = data["target_hw"].tolist()
         target_size = (target_w, target_h)  # (w, h)
 
-        # 加载条件图并 resize 到与 latent 对应的分辨率
+        # 加载条件图并调整到与 latent 对应的分辨率
         cond_image = self._load_conditioning_image(idx)
-        resizer = AspectRatioResize(target_size, center_crop=self.center_crop)
-        cond_image = resizer(cond_image)
+        if self.use_bucketing:
+            resizer = AspectRatioResize(target_size, center_crop=self.center_crop)
+            cond_image = resizer(cond_image)
+        else:
+            padder = AspectRatioPad(target_size, pad_color=self.pad_color)
+            cond_image, _cond_mask = padder(cond_image)
         if use_flip:
             cond_image = TF.hflip(cond_image)
         cond_tensor = T.ToTensor()(cond_image)  # [0, 1]，条件图不做 [-1,1] 归一化
@@ -325,6 +333,11 @@ class CachedLatentControlNetDataset(BaseImageDataset):
             "conditioning_pixel_values": cond_tensor,
             "input_ids": self.cached_input_ids.clone(),
         }
+
+        padding_mask = data.get("padding_mask", None)
+        if padding_mask is not None:
+            padding_mask = torch.flip(padding_mask, dims=[-1]) if use_flip else padding_mask
+            result["padding_mask"] = padding_mask.float()
 
         if "orig_max_channel" in data:
             omc = data["orig_max_channel"].float()  # (1, H/f, W/f)

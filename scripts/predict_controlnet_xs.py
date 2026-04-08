@@ -14,6 +14,7 @@
 """
 
 import argparse
+import hashlib
 import logging
 import random
 import sys
@@ -25,7 +26,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from diffusers import DPMSolverMultistepScheduler, PixArtTransformer2DModel
+from diffusers import DPMSolverSDEScheduler, PixArtTransformer2DModel
 from models.controlnet_xs_pixart import (
     PixArtControlNetXSAdapter,
     PixArtControlNetXSTransformerModel,
@@ -39,6 +40,50 @@ logger = logging.getLogger(__name__)
 _IMG_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 _ORIG_SUFFIX = "___total__1024.png"
 _COND_SUFFIX = "_controlnet_color_1024.png"
+
+
+def load_text_embed_cache(
+    train_data_dir: str,
+    caption: str,
+    negative_prompt: str = "",
+    model_type: str = "pixart_sigma",
+    device: torch.device = torch.device("cpu"),
+) -> dict[str, torch.Tensor] | None:
+    """尝试从训练数据目录加载预缓存的文本嵌入。
+
+    缓存路径与训练时一致: {train_data_dir}/text_embed_cache/embeds_{model_type}_{hash}.pt
+    """
+    cache_dir = Path(train_data_dir) / "text_embed_cache"
+    embed_hash = hashlib.md5(f"{caption}||{negative_prompt}".encode()).hexdigest()[:8]
+    cache_file = cache_dir / f"embeds_{model_type}_{embed_hash}.pt"
+
+    if not cache_file.exists():
+        logger.warning(f"未找到预缓存文本嵌入: {cache_file}")
+        return None
+
+    logger.info(f"加载预缓存文本嵌入: {cache_file}")
+    cached = torch.load(cache_file, map_location=device, weights_only=True)
+    return cached
+
+
+def load_per_image_text_embed(
+    train_data_dir: str,
+    stem: str,
+    model_type: str = "pixart_sigma",
+    device: torch.device = torch.device("cpu"),
+) -> dict[str, torch.Tensor] | None:
+    """加载逐图片预缓存的文本嵌入。
+
+    缓存路径: {train_data_dir}/../text_embed_per_image_cache_{model_type}/{stem}.pt
+    """
+    parent = Path(train_data_dir).parent
+    cache_dir = parent / f"text_embed_per_image_cache_{model_type}"
+    cache_file = cache_dir / f"{stem}.pt"
+
+    if not cache_file.exists():
+        return None
+
+    return torch.load(cache_file, map_location=device, weights_only=True)
 
 
 def strip_suffix(name: str, suffix: str) -> str | None:
@@ -143,6 +188,9 @@ def run_inference_for_checkpoint(
     overlay_alpha: float = 0.5,
     seed: int = 42,
     device: torch.device = torch.device("cuda"),
+    text_embed_cache: dict[str, torch.Tensor] | None = None,
+    train_data_dir: str | None = None,
+    prompt_mode: str = "fixed",
 ):
     """对单个检查点执行推理。"""
     ckpt_name = ckpt_dir.name
@@ -155,7 +203,10 @@ def run_inference_for_checkpoint(
         logger.warning(f"检查点 {ckpt_name} 缺少 transformer 或 controlnet 目录，跳过")
         return
 
-    # 加载基础组件（VAE + T5 + tokenizer + scheduler）
+    use_cached_embeds = text_embed_cache is not None or (
+        prompt_mode == "caption" and train_data_dir is not None
+    )
+
     components = load_pixart_sigma_components(
         base_model_path,
         weights_dir=weights_dir,
@@ -163,30 +214,30 @@ def run_inference_for_checkpoint(
         dtype=torch.bfloat16,
     )
     vae = components["vae"].to(device, dtype=torch.float32)
-    text_encoder = components["text_encoder"].to(device)
-    tokenizer = components["tokenizer"]
     noise_scheduler = components["noise_scheduler"]
 
-    # 加载微调后的 Transformer
+    if use_cached_embeds:
+        text_encoder = None
+        tokenizer = None
+        logger.info("使用预缓存文本嵌入，跳过加载 text_encoder")
+    else:
+        text_encoder = components["text_encoder"].to(device)
+        tokenizer = components["tokenizer"]
+
     transformer = PixArtTransformer2DModel.from_pretrained(
         str(transformer_dir), torch_dtype=torch.bfloat16
     ).to(device)
 
-    # 加载 ControlNet-XS adapter
     controlnet = PixArtControlNetXSAdapter.from_pretrained(
         str(controlnet_dir), torch_dtype=torch.bfloat16
     ).to(device)
 
-    # 构建联合模型
     joint_model = PixArtControlNetXSTransformerModel(
         transformer=transformer, controlnet=controlnet
     )
 
-    # 推理调度器: DPM-Solver++ (ODE) 对 DDPM epsilon 模型收敛快、控制精准
-    inference_scheduler = DPMSolverMultistepScheduler.from_config(
+    inference_scheduler = DPMSolverSDEScheduler.from_config(
         noise_scheduler.config,
-        algorithm_type="dpmsolver++",
-        solver_order=2,
         use_karras_sigmas=True,
     )
 
@@ -200,7 +251,6 @@ def run_inference_for_checkpoint(
     )
     pipeline.set_progress_bar_config(disable=True)
 
-    # 随机选取样本
     rng = random.Random(seed)
     selected = rng.sample(pairs, min(num_samples, len(pairs)))
 
@@ -213,18 +263,47 @@ def run_inference_for_checkpoint(
         cond_img = Image.open(cond_path).convert("RGB").resize((1024, 1024), Image.LANCZOS)
         gt_img = Image.open(train_path).convert("RGB").resize((1024, 1024), Image.LANCZOS)
 
-        if caption_dir is not None:
-            prompt = load_caption(caption_dir, base_key, fallback_caption)
+        # 构建 pipeline 参数: 优先使用预缓存嵌入
+        if text_embed_cache is not None:
+            pipeline_kwargs = {
+                "prompt": None,
+                "negative_prompt": None,
+                "prompt_embeds": text_embed_cache["prompt_embeds"].to(device),
+                "prompt_attention_mask": text_embed_cache["prompt_attention_mask"].to(device),
+                "negative_prompt_embeds": text_embed_cache["negative_prompt_embeds"].to(device),
+                "negative_prompt_attention_mask": text_embed_cache["negative_prompt_attention_mask"].to(device),
+            }
+        elif prompt_mode == "caption" and train_data_dir is not None:
+            per_img = load_per_image_text_embed(train_data_dir, base_key, device=device)
+            if per_img is not None:
+                neg_cache = text_embed_cache or {}
+                pipeline_kwargs = {
+                    "prompt": None,
+                    "negative_prompt": None,
+                    "prompt_embeds": per_img["prompt_embeds"].to(device),
+                    "prompt_attention_mask": per_img["prompt_attention_mask"].to(device),
+                    "negative_prompt_embeds": neg_cache.get(
+                        "negative_prompt_embeds",
+                        torch.zeros_like(per_img["prompt_embeds"]),
+                    ).to(device),
+                    "negative_prompt_attention_mask": neg_cache.get(
+                        "negative_prompt_attention_mask",
+                        torch.ones(1, per_img["prompt_embeds"].shape[1], dtype=torch.long),
+                    ).to(device),
+                }
+            else:
+                prompt = load_caption(caption_dir, base_key, fallback_caption) if caption_dir else fallback_caption
+                pipeline_kwargs = {"prompt": prompt, "negative_prompt": ""}
         else:
-            prompt = fallback_caption
+            prompt = load_caption(caption_dir, base_key, fallback_caption) if caption_dir else fallback_caption
+            pipeline_kwargs = {"prompt": prompt, "negative_prompt": ""}
 
         gen_imgs = []
         for j in range(images_per_sample):
-            generator = torch.Generator(device=device).manual_seed(seed + i * images_per_sample + j)
+            generator = torch.Generator(device="cpu").manual_seed(seed + i * images_per_sample + j)
             result = pipeline(
-                prompt=prompt,
+                **pipeline_kwargs,
                 image=cond_img,
-                negative_prompt="",
                 num_inference_steps=num_inference_steps,
                 guidance_scale=guidance_scale,
                 height=1024,
@@ -238,8 +317,9 @@ def run_inference_for_checkpoint(
 
         logger.info(f"  [{i+1}/{len(selected)}] {images_per_sample} images saved: {base_key[:60]}...")
 
-    # 释放显存
-    del pipeline, joint_model, transformer, controlnet, vae, text_encoder
+    del pipeline, joint_model, transformer, controlnet, vae
+    if text_encoder is not None:
+        del text_encoder
     torch.cuda.empty_cache()
 
     logger.info(f"=== 检查点 {ckpt_name} 完成，结果保存至: {save_dir} ===")
@@ -250,7 +330,7 @@ def main():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="/home/daiqing_tan/stable_diffusion_lora/outputs/controlnet_xs_pixart_sigma",
+        default="/home/daiqing_tan/stable_diffusion_lora/outputs/controlnet_xs_pixart_sigma_dual_lr",
         help="训练输出目录",
     )
     parser.add_argument(
@@ -287,12 +367,39 @@ def main():
     parser.add_argument("--overlay_alpha", type=float, default=0.5, help="叠加图中生成图的不透明度 (0=全条件图, 1=全生成图)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
+        "--prompt_mode",
+        type=str,
+        default="fixed",
+        choices=["caption", "fixed", "empty"],
+        help="提示词方案: caption=从文件加载每张图的描述, fixed=统一使用固定提示词, empty=空提示词",
+    )
+    parser.add_argument(
+        "--prompt_text",
+        type=str,
+        default="architectural floor plan, blueprint, technical drawing",
+        help="fixed 模式下使用的统一提示词",
+    )
+    parser.add_argument(
         "--ckpt",
         type=str,
         default=None,
         help="指定检查点名称 (如 best, step_003600)，默认遍历全部",
     )
+    parser.add_argument(
+        "--use_cached_embeds",
+        action="store_true",
+        default=True,
+        help="使用训练时预缓存的文本嵌入（与训练验证一致），默认开启",
+    )
+    parser.add_argument(
+        "--no_cached_embeds",
+        action="store_true",
+        help="禁用预缓存文本嵌入，使用实时 T5 编码",
+    )
     args = parser.parse_args()
+
+    if args.no_cached_embeds:
+        args.use_cached_embeds = False
 
     output_dir = Path(args.output_dir)
     ckpt_root = output_dir / "checkpoints"
@@ -320,7 +427,38 @@ def main():
     logger.info(f"将对以下检查点进行推理: {[d.name for d in ckpt_dirs]}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    fallback_caption = "architectural floor plan, blueprint, technical drawing"
+
+    if args.prompt_mode == "caption":
+        effective_caption_dir = caption_dir
+        fallback_caption = args.prompt_text
+    elif args.prompt_mode == "fixed":
+        effective_caption_dir = None
+        fallback_caption = args.prompt_text
+    else:  # empty
+        effective_caption_dir = None
+        fallback_caption = ""
+
+    # 加载预缓存文本嵌入
+    text_embed_cache = None
+    if args.use_cached_embeds:
+        neg_prompt = ""
+        if args.prompt_mode in ("fixed", "empty"):
+            text_embed_cache = load_text_embed_cache(
+                args.train_data_dir, fallback_caption, neg_prompt, device=device,
+            )
+        elif args.prompt_mode == "caption":
+            text_embed_cache = load_text_embed_cache(
+                args.train_data_dir, fallback_caption, neg_prompt, device=device,
+            )
+        if text_embed_cache is not None:
+            logger.info("已加载预缓存文本嵌入，推理将与训练验证保持一致")
+        else:
+            logger.warning("未找到预缓存文本嵌入，将回退到实时 T5 编码")
+
+    logger.info(f"提示词方案: {args.prompt_mode}" + (
+        f" (固定: {fallback_caption!r})" if args.prompt_mode != "caption" else
+        f" (caption_dir={effective_caption_dir}, fallback={fallback_caption!r})"
+    ))
 
     for ckpt_dir in ckpt_dirs:
         run_inference_for_checkpoint(
@@ -328,7 +466,7 @@ def main():
             base_model_path=args.base_model,
             weights_dir=args.weights_dir,
             pairs=pairs,
-            caption_dir=caption_dir,
+            caption_dir=effective_caption_dir,
             fallback_caption=fallback_caption,
             output_root=predict_root,
             num_samples=args.num_samples,
@@ -338,6 +476,9 @@ def main():
             overlay_alpha=args.overlay_alpha,
             seed=args.seed,
             device=device,
+            text_embed_cache=text_embed_cache,
+            train_data_dir=args.train_data_dir,
+            prompt_mode=args.prompt_mode,
         )
 
     logger.info(f"全部推理完成！结果保存在: {predict_root}")
