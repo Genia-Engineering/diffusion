@@ -420,6 +420,8 @@ class ControlNetTrainer(BaseTrainer):
             )
             self.global_step = state["step"]
             self.global_epoch = state["epoch"]
+            if "ema_loss" in state:
+                self._ema_loss = state["ema_loss"]
 
         val_cfg = self.config.get("validation", {})
         val_loop = ValidationLoop(
@@ -820,4 +822,5 @@ class ControlNetTrainer(BaseTrainer):
             lr_scheduler=lr_scheduler,
             seed=self.training_cfg.get("seed", 42),
             is_lora=self.joint_lora,
+            ema_loss=self._ema_loss,
         )

@@ -65,6 +65,10 @@ class BaseTrainer(ABC):
         self.global_step = 0
         self.global_epoch = 0
 
+        # EMA loss 追踪
+        self._ema_loss: float | None = None
+        self._ema_decay: float = float(self.training_cfg.get("ema_loss_decay", 0.99))
+
         # 损失函数配置
         self.loss_type: str = self.training_cfg.get("loss_type", "mse")
         self.huber_delta: float = float(self.training_cfg.get("huber_delta", 0.1))
@@ -147,6 +151,14 @@ class BaseTrainer(ABC):
         )
         return lr_scheduler
 
+    def _update_ema_loss(self, loss: float):
+        """更新 loss 的指数移动平均并记录到 TensorBoard。"""
+        if self._ema_loss is None:
+            self._ema_loss = loss
+        else:
+            self._ema_loss = self._ema_decay * self._ema_loss + (1 - self._ema_decay) * loss
+        self.tb_logger.log_ema_loss(self._ema_loss, self.global_step)
+
     def log_step(self, loss: float, lr: float, grad_norm: float = None,
                  projector_lr: float = None,
                  tf_grad_norm: float = None, proj_grad_norm: float = None):
@@ -159,6 +171,8 @@ class BaseTrainer(ABC):
             self.tb_logger.log_grad_norm(grad_norm, self.global_step)
         if tf_grad_norm is not None and proj_grad_norm is not None:
             self.tb_logger.log_grad_norm_group(tf_grad_norm, proj_grad_norm, self.global_step)
+
+        self._update_ema_loss(loss)
 
     @abstractmethod
     def _freeze_parameters(self):

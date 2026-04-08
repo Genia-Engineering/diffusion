@@ -49,13 +49,13 @@ controlnet:
   # ── 训练模式 ──
   # true  = 全参微调: base UNet + XS Adapter 均可训练
   # false = 冻结 base UNet, 仅训练 XS Adapter (~48M, ~1% of base)
-  train_unet: false
+  train_unet: true
 
   # ── 预训练 ControlNet-XS adapter 权重（可选）──
   # 指向之前训练的 checkpoint 目录（含 controlnet/ 子目录），
   # 或直接指向 controlnet/ 目录本身。
   # 设置后加载预训练 adapter 权重再进行训练（全参微调或继续 adapter-only）。
-  # pretrained_controlnet_path: "./outputs/controlnet_xs_sdxl/checkpoints/step_001200"
+  pretrained_controlnet_path: "./outputs/controlnet_xs_sdxl/checkpoints/step_010000"
 
   # ── ControlNet 独立学习率（可选，仅 train_unet=true 时生效）──
   # 设置后 XS Adapter 使用此 lr，base UNet 使用 training.learning_rate
@@ -63,26 +63,26 @@ controlnet:
   controlnet_lr: 1.0e-4
 
 controlnet_xs:
-  size_ratio: 0.3                  # adapter / base 参数比例；SDXL 下 0.1 ≈ 48M adapter
+  size_ratio: 0.2                  # adapter / base 参数比例；SDXL 下 0.1 ≈ 48M adapter
   no_ctrl_cross_attention: false    # 移除 ctrl 分支的 cross-attention，仅保留 ResNet
                                    # ctrl 不再直接处理文本嵌入，文本语义通过 base→ctrl 投射间接传递
                                    # 与 PixArt-Sigma XS 设计一致
 
 training:
-  output_dir: "./outputs/controlnet_xs_sdxl"
-  num_train_steps: 3600
-  learning_rate: 1.0e-4
-  train_batch_size: 8
-  gradient_accumulation_steps: 4
+  output_dir: "./outputs/controlnet_xs_sdxl_finetune"
+  num_train_steps: 10000
+  learning_rate: 1.0e-5            # base UNet 用低 lr
+  train_batch_size: 4              # 全参微调显存翻倍，batch 减半
+  gradient_accumulation_steps: 8   # 保持 effective batch = 32
   mixed_precision: "bf16"
   cache_latents: true
   latent_cache_batch_size: 16
   cache_text_embeddings: true
 
-  validation_steps: 300
-  save_steps: 300
-  keep_last_n_checkpoints: 8
-  lr_warmup_steps: 100
+  validation_steps: 500
+  save_steps: 500
+  keep_last_n_checkpoints: 10
+  lr_warmup_steps: 500             # 全参微调需更长 warmup 避免震荡
 
   gradient_checkpointing: true
   attention_backend: "sdpa"
@@ -154,25 +154,25 @@ validation:
 #         VAE 不更新权重，仅作为梯度传导的桥梁。
 #
 auxiliary_loss:
-  enabled: false
+  enabled: true
   weight: 0.003                    # total_loss = diffusion_loss + weight × aux_loss
-  timestep_threshold: 500        # 所有 timestep 均计算 (t_quality 线性衰减自动降权高 t)
-  fg_threshold: 0.1               # 前景判定阈值 (归一化 [0,1] 后, 背景≈0, 前景>0.1)
-  temperature: 20.0               # 预测侧软阈值陡峭度 (越大越接近硬阈值)
-  max_decode_samples: 2           # 每步最多 VAE decode 的样本数 (控制显存)
-  bg_weight: 0.0                  # 背景区域权重 (0=完全忽略背景)
-  labels:                         # 控制图中各语义 label 的 RGB 颜色与权重
-    - rgb: [220, 120, 0]          # label_6_deck    平台/甲板 (橙色)
-      weight: 0.0
-    - rgb: [220, 0, 0]            # label_4_doors   门 (红色) ← 消融测试：仅监督门
-      weight: 5.0
-    - rgb: [20, 50, 230]          # label_5_general_opening  通用开口 (蓝色)
-      weight: 0.0
-    - rgb: [230, 230, 230]        # label_7_walls   墙体 (浅灰)
-      weight: 0.0
-    - rgb: [220, 220, 0]          # label_5_stair_opening  楼梯开口 (黄色)
-      weight: 0.0
-    - rgb: [0, 200, 0]            # label_4_windows 窗户 (绿色)
-      weight: 0.0
-    - rgb: [180, 0, 200]          # label_8_posts   立柱/柱子 (紫色)
-      weight: 0.0
+  timestep_threshold: 500          # 所有 timestep 均计算 (t_quality 线性衰减自动降权高 t)
+  fg_threshold: 0.1                # 前景判定阈值 (归一化 [0,1] 后, 背景≈0, 前景>0.1)
+  temperature: 20.0                # 预测侧软阈值陡峭度 (越大越接近硬阈值)
+  max_decode_samples: 2            # 每步最多 VAE decode 的样本数 (控制显存)
+  bg_weight: 0.0                   # 背景区域权重 (0=完全忽略背景)
+  labels:                          # 控制图中各语义 label 的 RGB 颜色与权重
+    - rgb: [220, 120, 0]           # label_6_deck    平台/甲板 (橙色)
+      weight: 1.0
+    - rgb: [220, 0, 0]             # label_4_doors   门 (红色)
+      weight: 3.0
+    - rgb: [20, 50, 230]           # label_5_general_opening  通用开口 (蓝色)
+      weight: 2.0
+    - rgb: [230, 230, 230]         # label_7_walls   墙体 (浅灰)
+      weight: 1.0
+    - rgb: [220, 220, 0]           # label_5_stair_opening  楼梯开口 (黄色)
+      weight: 2.0
+    - rgb: [0, 200, 0]             # label_4_windows 窗户 (绿色)
+      weight: 2.0
+    - rgb: [180, 0, 200]           # label_8_posts   立柱/柱子 (紫色)
+      weight: 1.0

@@ -121,6 +121,14 @@ done
 # ── 项目目录 & GPU 配置 ──────────────────────────────────────
 PROJ_DIR="/home/daiqing_tan/stable_diffusion_lora"
 
+# 优先使用 pip 安装的 CUDA 库（避免 cublasLtCreate 加载失败）
+_SITE_PKG=$(python -c "import site; print(site.getsitepackages()[0])" 2>/dev/null || true)
+if [[ -n "$_SITE_PKG" ]]; then
+    NVIDIA_LIB_PATH="${_SITE_PKG}/nvidia/cu13/lib:${_SITE_PKG}/nvidia/cudnn/lib"
+    export LD_LIBRARY_PATH="${NVIDIA_LIB_PATH}:${LD_LIBRARY_PATH:-}"
+fi
+unset _SITE_PKG
+
 # ★ 在此修改使用哪几张卡，num_processes 会自动计算
 GPUS="0"
 NUM_GPUS=$(echo "$GPUS" | tr ',' '\n' | wc -l)
@@ -466,6 +474,7 @@ fi
 # ── tmux 后台启动 ────────────────────────────────────────────
 tmux new-session -d -s "$SESSION" -x 220 -y 50 "
     cd ${PROJ_DIR}
+    export LD_LIBRARY_PATH=${NVIDIA_LIB_PATH:-}:\$LD_LIBRARY_PATH
     echo '[START] '$(date '+%Y-%m-%d %H:%M:%S') | tee -a ${LOG_FILE}
     echo '[CMD]   ${TRAIN_CMD}'                 | tee -a ${LOG_FILE}
     eval ${TRAIN_CMD} 2>&1 | tee -a ${LOG_FILE}

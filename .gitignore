@@ -55,5 +55,15 @@ runs/
 .DS_Store
 Thumbs.db
 
+# Archives
+*.tar
+*.tar.gz
+*.tar.zst
+*.tar.bz2
+*.tar.xz
+*.zip
+*.7z
+*.rar
+
 # Misc
 train_output.log

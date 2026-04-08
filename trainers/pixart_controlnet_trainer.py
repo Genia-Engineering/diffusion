@@ -507,8 +507,8 @@ class PixArtControlNetTrainer(BaseTrainer):
 
         # 恢复训练
         save_best = self.training_cfg.get("save_best", False)
-        best_ema_decay = float(self.training_cfg.get("best_loss_ema_decay", 0.99))
-        self._ema_loss: float | None = None
+        self._ema_decay = float(self.training_cfg.get("best_loss_ema_decay", 0.99))
+        self._ema_loss = None
         self._best_loss = self.ckpt_manager.load_best_metric() if save_best else float("inf")
 
         resume_dir = self.training_cfg.get("resume_from_checkpoint", None)
@@ -620,12 +620,6 @@ class PixArtControlNetTrainer(BaseTrainer):
                     progress_bar.set_postfix(loss=f"{step_loss:.4f}", lr=f"{current_lr:.2e}")
 
                     if save_best:
-                        if self._ema_loss is None:
-                            self._ema_loss = step_loss
-                        else:
-                            self._ema_loss = best_ema_decay * self._ema_loss + (1 - best_ema_decay) * step_loss
-                        self.tb_logger.log_ema_loss(self._ema_loss, self.global_step)
-
                         if self._ema_loss < self._best_loss:
                             self._best_loss = self._ema_loss
                             self.tb_logger.log_best_loss(self._best_loss, self.global_step)

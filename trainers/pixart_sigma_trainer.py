@@ -452,8 +452,6 @@ class PixArtSigmaTrainer(BaseTrainer):
                     current_loss = loss.item()
                     current_lr = lr_scheduler.get_last_lr()[0]
                     self.log_step(current_loss, current_lr, grad_norm)
-
-                    self._update_ema_loss(current_loss)
                     self._maybe_save_best()
 
                     progress_bar.update(1)
@@ -809,13 +807,6 @@ class PixArtSigmaTrainer(BaseTrainer):
             latents_list.append(z_noisy.to(dtype=torch.bfloat16))
 
         return latents_list, img2img_timesteps
-
-    def _update_ema_loss(self, loss: float):
-        """更新 loss 的指数移动平均。"""
-        if self._ema_loss is None:
-            self._ema_loss = loss
-        else:
-            self._ema_loss = self._ema_decay * self._ema_loss + (1 - self._ema_decay) * loss
 
     def _maybe_save_best(self):
         """若 EMA loss 为历史最低且距上次保存已过最小间隔，保存 best checkpoint。"""

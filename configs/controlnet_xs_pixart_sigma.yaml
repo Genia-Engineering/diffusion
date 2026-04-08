@@ -45,7 +45,7 @@ controlnet:
   # ── 训练模式 ──
   # true  = 全参微调: Transformer + XS Adapter 均可训练
   # false = 冻结 Transformer, 仅训练 XS Adapter (~24M, 3.9% of base)
-  train_transformer: true
+  train_transformer: false
 
   # ── ControlNet 独立学习率（可选，仅 train_transformer=true 时生效）──
   # 设置后 XS Adapter 使用此 lr，Transformer 使用 training.learning_rate
@@ -61,8 +61,8 @@ training:
   output_dir: "./outputs/controlnet_xs_pixart_sigma"
   num_train_steps: 3600                 # ~60 epoch
   # 全参模式推荐 1e-4, 仅 ControlNet 模式推荐 2e-4 ~ 5e-4
-  learning_rate: 1.0e-4
-  train_batch_size: 4
+  learning_rate: 5.0e-4
+  train_batch_size: 8
   gradient_accumulation_steps: 4        # effective batch = 2×1GPU×4accum = 8
   mixed_precision: "bf16"
   cache_latents: true
@@ -109,6 +109,7 @@ data:
   caption_mode: "fixed"
 
   caption: "architectural floor plan, blueprint, technical drawing"
+
 
   # ── 逐图 caption 配置 ──
   caption_dir: "/home/daiqing_tan/stable_diffusion_lora/data/data/description"

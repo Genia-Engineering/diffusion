@@ -602,6 +602,8 @@ class ControlNetXSTrainer(ControlNetTrainer):
                 )
             self.global_step = state["step"]
             self.global_epoch = state["epoch"]
+            if "ema_loss" in state:
+                self._ema_loss = state["ema_loss"]
 
         val_cfg = self.config.get("validation", {})
         prompt_source = val_cfg.get("prompt_source", "config")
@@ -918,6 +920,7 @@ class ControlNetXSTrainer(ControlNetTrainer):
             optimizer=optimizer,
             lr_scheduler=lr_scheduler,
             seed=self.training_cfg.get("seed", 42),
+            ema_loss=self._ema_loss,
         )
 
         # 3. 保存完整 unet_xs state dict（权威存档，用于恢复训练）
