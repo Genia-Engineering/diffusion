@@ -137,11 +137,21 @@ class BaseTrainer(ABC):
     def setup_lr_scheduler(self, optimizer, num_training_steps: int):
         """配置学习率调度器 — 默认 cosine with warmup。
 
+        支持通过 lr_min_ratio 设置 cosine 衰减的最小学习率下限:
+          lr_min_ratio: 0.0 ~ 1.0，最小 lr = peak_lr × lr_min_ratio
+          默认 0.0 即衰减到 0（与原行为一致）
+
         注意：BucketSampler 已按 rank 分片，lr_scheduler.step() 每个 global step
         只调用 1 次（不随 num_processes 倍增），因此不乘以 num_processes。
         """
         warmup_steps = self.training_cfg.get("lr_warmup_steps", 100)
         scheduler_type = self.training_cfg.get("lr_scheduler", "cosine")
+        min_lr_ratio = float(self.training_cfg.get("lr_min_ratio", 0.0))
+
+        if min_lr_ratio > 0 and scheduler_type == "cosine":
+            return self._cosine_with_min_lr(
+                optimizer, warmup_steps, num_training_steps, min_lr_ratio,
+            )
 
         lr_scheduler = get_scheduler(
             scheduler_type,
@@ -150,6 +160,27 @@ class BaseTrainer(ABC):
             num_training_steps=num_training_steps,
         )
         return lr_scheduler
+
+    @staticmethod
+    def _cosine_with_min_lr(
+        optimizer, warmup_steps: int, total_steps: int, min_lr_ratio: float,
+    ):
+        """Cosine annealing with linear warmup and non-zero floor lr.
+
+        每个 param_group 独立计算: min_lr = group['lr'] × min_lr_ratio，
+        因此双学习率场景下各组保持正确的衰减比例。
+        """
+        from torch.optim.lr_scheduler import LambdaLR
+
+        def lr_lambda(current_step: int) -> float:
+            if current_step < warmup_steps:
+                return current_step / max(warmup_steps, 1)
+            decay_steps = total_steps - warmup_steps
+            progress = min((current_step - warmup_steps) / max(decay_steps, 1), 1.0)
+            cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay
+
+        return LambdaLR(optimizer, lr_lambda)
 
     def _update_ema_loss(self, loss: float):
         """更新 loss 的指数移动平均并记录到 TensorBoard。"""

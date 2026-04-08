@@ -24,6 +24,7 @@ training:
   noise_offset: 0.0                 # 噪声偏移量；0 = 关闭，推荐值 0.05~0.1
   min_snr_gamma: 0.0                # Min-SNR 加权系数；0 = 关闭，推荐值 5.0
   lr_warmup_steps: 100
+  # lr_min_ratio: 0.1                 # cosine 最低衰减到 peak_lr 的 10% (默认 0 即衰减到 0)
   dataloader_num_workers: 4
   cache_text_embeddings: true       # 预计算并缓存文本嵌入，卸载文本编码器节省显存（仅当 train_text_encoder=false 时生效）
   cache_latents: true              # 预计算所有图片的 VAE latent 存磁盘，训练时跳过 VAE encode，并卸载 encoder 节省显存

@@ -31,6 +31,7 @@ training:
   save_steps: 1000
   keep_last_n_checkpoints: 4
   lr_warmup_steps: 300
+  # lr_min_ratio: 0.1                 # cosine 最低衰减到 peak_lr 的 10% (默认 0 即衰减到 0)
 
   gradient_checkpointing: true
   attention_backend: "sdpa"

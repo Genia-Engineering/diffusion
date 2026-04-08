@@ -45,6 +45,7 @@ training:
   save_steps: 300                    # 每 10 epoch 保存一次
   keep_last_n_checkpoints: 12
   lr_warmup_steps: 150               # 前 ~6 epoch warmup (~10% 总步数)
+  # lr_min_ratio: 0.1                # cosine 最低衰减到 peak_lr 的 10% (默认 0 即衰减到 0)
   gradient_checkpointing: true       # 开启后激活值显存大幅下降（batch=8 约 12-14GB）
   compile_model: false               # autotune 第一步峰值显存冲至 ~22GB 导致 OOM，保持关闭
   loss_type: "mse"

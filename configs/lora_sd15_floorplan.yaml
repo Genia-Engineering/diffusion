@@ -58,6 +58,7 @@ training:
   save_steps: 426                   # 2130 ÷ 5 = 426，均匀保存 5 个 checkpoint
   keep_last_n_checkpoints: 5
   lr_warmup_steps: 360              # ~17% 总步数（2130 × 0.17 ≈ 360）
+  # lr_min_ratio: 0.1               # cosine 最低衰减到 peak_lr 的 10% (默认 0 即衰减到 0)
 
 data:
   train_data_dir: "/home/daiqing_tan/stable_diffusion_lora/data/data/size_512"

@@ -51,6 +51,7 @@ training:
   save_steps: 300                   # 每 N 步保存一次 checkpoint
   keep_last_n_checkpoints: 10        # 仅保留最近 N 个 checkpoint，自动清理旧的
   lr_warmup_steps: 100              # 学习率线性预热步数（~1 epoch），避免初期震荡
+  # lr_min_ratio: 0.1               # cosine 最低衰减到 peak_lr 的 10% (默认 0 即衰减到 0)
   caption_dropout_rate: 0.1         # 训练时以 10% 概率丢弃 caption（用空嵌入替换），增强无条件生成能力
   gradient_checkpointing: true      # 梯度检查点，用计算换显存
   compile_model: false              # 是否 torch.compile 加速（当前关闭）

@@ -60,6 +60,7 @@ training:
   save_steps: 162                   # 810 ÷ 5 = 162，均匀保存 5 个 checkpoint
   keep_last_n_checkpoints: 5
   lr_warmup_steps: 138              # ~17% 总步数（810 × 0.17 ≈ 138）
+  # lr_min_ratio: 0.1               # cosine 最低衰减到 peak_lr 的 10% (默认 0 即衰减到 0)
 
   loss_type: "mse"                # Huber loss 替代 MSE，对异常值更鲁棒
   huber_delta: 0.1                  # Huber loss delta 参数

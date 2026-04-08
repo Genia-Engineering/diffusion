@@ -69,6 +69,7 @@ training:
   save_best: true
   best_loss_ema_decay: 0.99
   lr_warmup_steps: 200                  # 前 4% 总步数 warmup
+  # lr_min_ratio: 0.1                   # cosine 最低衰减到 peak_lr 的 10% (默认 0 即衰减到 0)
   gradient_checkpointing: true
   attention_backend: "sdpa"
   allow_tf32: true

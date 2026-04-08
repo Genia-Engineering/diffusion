@@ -191,6 +191,7 @@ def run_inference_for_checkpoint(
     text_embed_cache: dict[str, torch.Tensor] | None = None,
     train_data_dir: str | None = None,
     prompt_mode: str = "fixed",
+    finetuned_transformer_path: str | None = None,
 ):
     """对单个检查点执行推理。"""
     ckpt_name = ckpt_dir.name
@@ -199,9 +200,21 @@ def run_inference_for_checkpoint(
     transformer_dir = ckpt_dir / "transformer"
     controlnet_dir = ckpt_dir / "controlnet"
 
-    if not transformer_dir.exists() or not controlnet_dir.exists():
-        logger.warning(f"检查点 {ckpt_name} 缺少 transformer 或 controlnet 目录，跳过")
+    if not controlnet_dir.exists():
+        logger.warning(f"检查点 {ckpt_name} 缺少 controlnet 目录，跳过")
         return
+
+    # adapter-only 模式: 检查点里没有 transformer，从外部路径加载
+    if not transformer_dir.exists():
+        if finetuned_transformer_path and Path(finetuned_transformer_path).exists():
+            transformer_dir = Path(finetuned_transformer_path)
+            logger.info(f"检查点无 transformer 目录，使用微调 transformer: {transformer_dir}")
+        else:
+            logger.warning(
+                f"检查点 {ckpt_name} 缺少 transformer 目录，"
+                f"且未提供有效的 --finetuned_transformer_path，跳过"
+            )
+            return
 
     use_cached_embeds = text_embed_cache is not None or (
         prompt_mode == "caption" and train_data_dir is not None
@@ -330,7 +343,7 @@ def main():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="/home/daiqing_tan/stable_diffusion_lora/outputs/controlnet_xs_pixart_sigma_dual_lr",
+        default="/home/daiqing_tan/stable_diffusion_lora/outputs/controlnet_xs_pixart_sigma_adapter_only",
         help="训练输出目录",
     )
     parser.add_argument(
@@ -395,6 +408,12 @@ def main():
         "--no_cached_embeds",
         action="store_true",
         help="禁用预缓存文本嵌入，使用实时 T5 编码",
+    )
+    parser.add_argument(
+        "--finetuned_transformer_path",
+        type=str,
+        default="./outputs/pixart_sigma_floorplan/checkpoints/step_003600/transformer",
+        help="微调后的 Transformer 权重路径 (adapter-only 模式下必需)",
     )
     args = parser.parse_args()
 
@@ -479,6 +498,7 @@ def main():
             text_embed_cache=text_embed_cache,
             train_data_dir=args.train_data_dir,
             prompt_mode=args.prompt_mode,
+            finetuned_transformer_path=args.finetuned_transformer_path,
         )
 
     logger.info(f"全部推理完成！结果保存在: {predict_root}")
