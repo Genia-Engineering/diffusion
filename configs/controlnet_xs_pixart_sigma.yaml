@@ -75,6 +75,11 @@ training:
 
   save_best: true
   best_loss_ema_decay: 0.99
+
+  use_ema: true
+  ema_decay: 0.9999
+  ema_update_after_step: 150            # warmup 阶段学习率不稳定，跳过 EMA 更新
+
   lr_warmup_steps: 150                  # 前 ~10% 总步数 warmup
   # lr_min_ratio: 0.1                   # cosine 最低衰减到 peak_lr 的 10% (默认 0 即衰减到 0)
   gradient_checkpointing: true

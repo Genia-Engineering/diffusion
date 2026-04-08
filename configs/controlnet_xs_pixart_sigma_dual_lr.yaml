@@ -31,7 +31,7 @@ model:
   weights_dir: "/home/daiqing_tan/stable_diffusion_lora/weights"
   # 微调后的 Transformer 权重路径（可选）
   # 设置后将覆盖 pretrained 权重，用领域适配后的 Transformer 初始化
-  finetuned_transformer_path: "./outputs/pixart_sigma_floorplan/checkpoints/step_003600/transformer"
+  finetuned_transformer_path: "/home/daiqing_tan/stable_diffusion_lora/outputs/pixart_aigma_step_003600/transformer"
 
 controlnet:
   conditioning_mode: "cnn_encoder"
@@ -52,24 +52,29 @@ controlnet_xs:
 
 training:
   output_dir: "./outputs/controlnet_xs_pixart_sigma_dual_lr"
-  num_train_steps: 3600                 # ~60 epoch
+  num_train_steps: 8000                 # ~60 epoch
   # 主干网络学习率 — 预训练权重使用较小 lr 防止灾难性遗忘
   learning_rate: 5.0e-5
-  train_batch_size: 2
-  gradient_accumulation_steps: 8        # effective batch = 2×1GPU×4accum = 8
+  train_batch_size: 8
+  gradient_accumulation_steps: 4        # effective batch = 2×1GPU×4accum = 8
   mixed_precision: "bf16"
   cache_latents: true
   cache_text_embeddings: true
   latent_cache_batch_size: 4
 
-  validation_steps: 300
-  save_steps: 300
+  validation_steps: 500
+  save_steps: 500
   keep_last_n_checkpoints: 12
 
   save_best: true
   best_loss_ema_decay: 0.99
-  lr_warmup_steps: 150                  # 前 ~10% 总步数 warmup
-  lr_min_ratio: 0.1                      # cosine 最低衰减到 peak_lr 的 10%
+
+  use_ema: true
+  ema_decay: 0.9999
+  ema_update_after_step: 400            # warmup 阶段学习率不稳定，跳过 EMA 更新
+
+  lr_warmup_steps: 400                  # 前 ~10% 总步数 warmup
+  lr_min_ratio: 0.2                      # cosine 最低衰减到 peak_lr 的 10%
   gradient_checkpointing: true
   attention_backend: "sdpa"
   allow_tf32: true

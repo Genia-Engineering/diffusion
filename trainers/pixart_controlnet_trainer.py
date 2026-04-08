@@ -27,6 +27,7 @@ from models.controlnet_pixart import (
     PixArtControlNetTransformerModel,
 )
 from models.model_loader import load_pixart_sigma_components
+from utils.ema import EMAModel
 from utils.memory import apply_memory_optimizations
 from utils.validation import ValidationLoop
 from .base_trainer import BaseTrainer
@@ -58,6 +59,9 @@ class PixArtControlNetTrainer(BaseTrainer):
         self.conditioning_mode: str = str(self.cn_cfg.get("conditioning_mode", "vae"))
         self.train_transformer: bool = bool(self.cn_cfg.get("train_transformer", False))
         self.caption_dropout_rate: float = float(self.training_cfg.get("caption_dropout_rate", 0.0))
+
+        self._ema_transformer: EMAModel | None = None
+        self._ema_controlnet: EMAModel | None = None
 
         self._load_models()
         self._create_controlnet()
@@ -505,6 +509,25 @@ class PixArtControlNetTrainer(BaseTrainer):
         if not cache_text_embeddings and self.text_encoder is not None:
             self.text_encoder.to(self.accelerator.device)
 
+        # EMA 权重
+        use_ema = self.training_cfg.get("use_ema", False)
+        self._ema_transformer = None
+        self._ema_controlnet = None
+        if use_ema:
+            ema_decay = float(self.training_cfg.get("ema_decay", 0.9999))
+            ema_update_after = int(self.training_cfg.get("ema_update_after_step", 0))
+            unwrapped = self.accelerator.unwrap_model(self.joint_model)
+            if self.train_transformer:
+                self._ema_transformer = EMAModel(
+                    unwrapped.transformer.parameters(), decay=ema_decay,
+                    update_after_step=ema_update_after,
+                )
+            self._ema_controlnet = EMAModel(
+                unwrapped.controlnet.parameters(), decay=ema_decay,
+                update_after_step=ema_update_after,
+            )
+            logger.info(f"EMA enabled: decay={ema_decay}, update_after_step={ema_update_after}")
+
         # 恢复训练
         save_best = self.training_cfg.get("save_best", False)
         self._ema_decay = float(self.training_cfg.get("best_loss_ema_decay", 0.99))
@@ -532,6 +555,22 @@ class PixArtControlNetTrainer(BaseTrainer):
                 )
             else:
                 logger.info(f"Resumed from step {self.global_step}")
+
+            if use_ema:
+                ema_tf_path = os.path.join(resume_dir, "ema_transformer.pt")
+                ema_cn_path = os.path.join(resume_dir, "ema_controlnet.pt")
+                if self._ema_transformer is not None and os.path.exists(ema_tf_path):
+                    self._ema_transformer.load_state_dict(
+                        torch.load(ema_tf_path, map_location="cpu", weights_only=True)
+                    )
+                    self._ema_transformer.to(device=self.accelerator.device)
+                    logger.info(f"EMA transformer loaded from {ema_tf_path}")
+                if self._ema_controlnet is not None and os.path.exists(ema_cn_path):
+                    self._ema_controlnet.load_state_dict(
+                        torch.load(ema_cn_path, map_location="cpu", weights_only=True)
+                    )
+                    self._ema_controlnet.to(device=self.accelerator.device)
+                    logger.info(f"EMA controlnet loaded from {ema_cn_path}")
         elif save_best and self._best_loss < float("inf"):
             logger.info(f"Loaded best EMA loss from previous run: {self._best_loss:.6f}")
 
@@ -593,6 +632,12 @@ class PixArtControlNetTrainer(BaseTrainer):
                     optimizer.zero_grad()
 
                 if self.accelerator.sync_gradients:
+                    if self._ema_controlnet is not None:
+                        unwrapped = self.accelerator.unwrap_model(self.joint_model)
+                        if self._ema_transformer is not None:
+                            self._ema_transformer.step(unwrapped.transformer.parameters())
+                        self._ema_controlnet.step(unwrapped.controlnet.parameters())
+
                     lr_scheduler.step()
                     self.global_step += 1
                     step_loss = loss.item()
@@ -630,7 +675,9 @@ class PixArtControlNetTrainer(BaseTrainer):
                         self.accelerator.wait_for_everyone()
 
                     if self.global_step % validation_steps == 0:
+                        self._swap_to_ema_weights()
                         self._run_validation(val_loop)
+                        self._restore_from_ema_weights()
                         self.accelerator.wait_for_everyone()
 
             if self.global_step >= num_train_steps:
@@ -982,6 +1029,37 @@ class PixArtControlNetTrainer(BaseTrainer):
 
         return conditioning_images, ground_truth_images
 
+    # ── EMA 权重切换 ─────────────────────────────────────────────────────
+
+    def _swap_to_ema_weights(self):
+        """将模型参数切换为 EMA 权重（用于验证/保存 best），需与 _restore 配对。"""
+        if self._ema_controlnet is None:
+            return
+        unwrapped = self.accelerator.unwrap_model(self.joint_model)
+        if self._ema_transformer is not None:
+            self._ema_transformer.store(unwrapped.transformer.parameters())
+            self._ema_transformer.copy_to(unwrapped.transformer.parameters())
+        self._ema_controlnet.store(unwrapped.controlnet.parameters())
+        self._ema_controlnet.copy_to(unwrapped.controlnet.parameters())
+
+    def _restore_from_ema_weights(self):
+        """将模型参数从 EMA 权重恢复为训练权重。"""
+        if self._ema_controlnet is None:
+            return
+        unwrapped = self.accelerator.unwrap_model(self.joint_model)
+        if self._ema_transformer is not None:
+            self._ema_transformer.restore(unwrapped.transformer.parameters())
+        self._ema_controlnet.restore(unwrapped.controlnet.parameters())
+
+    def _save_ema_state_dicts(self, ckpt_dir: Path):
+        """将 EMA state dict 保存到检查点目录。"""
+        if self._ema_controlnet is None:
+            return
+        if self._ema_transformer is not None:
+            torch.save(self._ema_transformer.state_dict(), ckpt_dir / "ema_transformer.pt")
+        torch.save(self._ema_controlnet.state_dict(), ckpt_dir / "ema_controlnet.pt")
+        logger.info(f"EMA state dicts saved to {ckpt_dir}")
+
     # ── 检查点 ───────────────────────────────────────────────────────────
 
     def _save_checkpoint(self, optimizer, lr_scheduler):
@@ -1004,9 +1082,14 @@ class PixArtControlNetTrainer(BaseTrainer):
 
         self.ckpt_manager.save(**save_kwargs)
 
+        ckpt_dir = self.ckpt_manager.save_dir / f"step_{self.global_step:06d}"
+        self._save_ema_state_dicts(ckpt_dir)
+
     def _save_best_checkpoint(self, optimizer, lr_scheduler, best_loss: float):
         if not self.accelerator.is_main_process:
             return
+
+        self._swap_to_ema_weights()
 
         save_kwargs = {
             "step": self.global_step,
@@ -1023,3 +1106,8 @@ class PixArtControlNetTrainer(BaseTrainer):
             save_kwargs["accelerator"] = self.accelerator
 
         self.ckpt_manager.save_best(**save_kwargs)
+
+        best_dir = self.ckpt_manager.save_dir / "best"
+        self._save_ema_state_dicts(best_dir)
+
+        self._restore_from_ema_weights()
