@@ -65,5 +65,8 @@ Thumbs.db
 *.7z
 *.rar
 
+# Local config overrides (keep local settings, don't track)
+configs/controlnet_xs_pixart_sigma.yaml
+
 # Misc
 train_output.log
