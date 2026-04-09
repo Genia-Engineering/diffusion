@@ -36,6 +36,7 @@ class PixArtIPAdapterCachedDataset(BaseImageDataset):
         clip_feature_cache_dir: str,
         resolution: int = 1024,
         random_flip: bool = True,
+        exclude_stems: set[str] | None = None,
     ):
         super().__init__(
             data_dir, resolution=resolution,
@@ -66,6 +67,13 @@ class PixArtIPAdapterCachedDataset(BaseImageDataset):
                     f"[IPAdapter] 过滤掉 {dropped} 张无条件图匹配的训练图 "
                     f"({before} → {len(self.image_paths)})"
                 )
+
+        if exclude_stems:
+            import logging as _logging
+            _logger = _logging.getLogger(__name__)
+            before = len(self.image_paths)
+            self.image_paths = [p for p in self.image_paths if p.stem not in exclude_stems]
+            _logger.info(f"验证集排除: {before} → {len(self.image_paths)} (排除 {before - len(self.image_paths)} 张)")
 
     @staticmethod
     def _base_key_from_path(p: Path) -> str:

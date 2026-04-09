@@ -112,6 +112,8 @@ data:
   caption_fallback: "architectural floor plan, blueprint, technical drawing"
 
 validation:
+  num_val_split: 20
+  val_split_seed: 42
   # ── 验证提示词来源 ──
   # "config"  — 使用下方 prompts 列表中的固定提示词
   # "data"    — 从训练集随机挑选 num_val_prompts 张图对应的逐图 caption

@@ -1,8 +1,11 @@
 """训练器基类 — accelerate 初始化、优化器配置、显存优化、损失计算、抽象训练接口。"""
 
+import json
 import logging
 import math
 import os
+import random
+import shutil
 from abc import ABC, abstractmethod
 from datetime import timedelta
 from pathlib import Path
@@ -236,6 +239,77 @@ class BaseTrainer(ABC):
         logger.info(
             f"Trainable params: {trainable_params:,} / {total_params:,} ({pct:.2f}%)"
         )
+
+    # ── 验证集拆分 ─────────────────────────────────────────────────────
+
+    def _prepare_validation_split(self):
+        """从训练集中拆分固定验证集，复制到 {output_dir}/val_split/。
+
+        首次运行时随机抽取 num_val_split 张图片，复制到独立目录并保存 manifest.json。
+        恢复训练时直接读取 manifest 复用相同拆分。子类可覆写以处理配对条件图。
+        """
+        from data.dataset import IMAGE_EXTENSIONS
+
+        val_cfg = self.config.get("validation", {})
+        num_split = int(val_cfg.get("num_val_split", 0))
+        if num_split <= 0:
+            self._val_exclude_stems = set()
+            return
+
+        split_dir = Path(self.training_cfg.output_dir) / "val_split"
+        manifest_path = split_dir / "manifest.json"
+
+        if manifest_path.exists():
+            with open(manifest_path, "r") as f:
+                manifest = json.load(f)
+            self._val_exclude_stems = set(manifest["stems"])
+            logger.info(
+                f"已加载验证集拆分 manifest: {len(self._val_exclude_stems)} 张 "
+                f"(from {manifest_path})"
+            )
+            return
+
+        train_dir = Path(self.config.data.train_data_dir)
+        train_images = sorted(
+            p for p in train_dir.iterdir()
+            if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
+        )
+
+        seed = int(val_cfg.get("val_split_seed", 42))
+        rng = random.Random(seed)
+        selected = rng.sample(train_images, min(num_split, len(train_images)))
+
+        if self.accelerator.is_main_process:
+            train_split_dir = split_dir / "train"
+            train_split_dir.mkdir(parents=True, exist_ok=True)
+
+            stems = []
+            train_files = []
+            for img_path in selected:
+                shutil.copy2(img_path, train_split_dir / img_path.name)
+                stems.append(img_path.stem)
+                train_files.append(img_path.name)
+
+            manifest = {
+                "stems": stems,
+                "train_files": train_files,
+                "seed": seed,
+                "num_split": len(selected),
+            }
+            with open(manifest_path, "w") as f:
+                json.dump(manifest, f, indent=2, ensure_ascii=False)
+
+            logger.info(
+                f"验证集拆分完成: {len(selected)} 张图片 → {split_dir} (seed={seed})"
+            )
+
+        self.accelerator.wait_for_everyone()
+
+        if not self.accelerator.is_main_process:
+            with open(manifest_path, "r") as f:
+                manifest = json.load(f)
+
+        self._val_exclude_stems = set(manifest["stems"])
 
     # ── 共用损失计算 ─────────────────────────────────────────────────────
 

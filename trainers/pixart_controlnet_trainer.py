@@ -9,9 +9,12 @@
   "cnn_encoder" — 条件图通过轻量 CNN 映射到 latent 维度（在线计算）
 """
 
+import json
 import logging
 import math
 import os
+import random
+import shutil
 from pathlib import Path
 
 import torch
@@ -143,6 +146,106 @@ class PixArtControlNetTrainer(BaseTrainer):
             self.controlnet.requires_grad_(True)
             self.print_trainable_params(self.controlnet)
 
+    # ── 验证集拆分（覆写基类: 同时拆分训练图 + 条件图配对）─────────────
+
+    def _prepare_validation_split(self):
+        """从训练集中拆分固定验证集（含条件图配对），复制到 {output_dir}/val_split/。"""
+        from data.controlnet_dataset import (
+            _KNOWN_SUFFIX_PAIRS, _strip_known_suffix, _build_cond_index,
+        )
+        from data.dataset import IMAGE_EXTENSIONS
+
+        val_cfg = self.config.get("validation", {})
+        num_split = int(val_cfg.get("num_val_split", 0))
+        if num_split <= 0:
+            self._val_exclude_stems = set()
+            return
+
+        split_dir = Path(self.training_cfg.output_dir) / "val_split"
+        manifest_path = split_dir / "manifest.json"
+
+        if manifest_path.exists():
+            with open(manifest_path, "r") as f:
+                manifest = json.load(f)
+            self._val_exclude_stems = set(manifest["base_keys"])
+            logger.info(
+                f"已加载验证集拆分 manifest: {len(self._val_exclude_stems)} 张 "
+                f"(from {manifest_path})"
+            )
+            return
+
+        train_dir = Path(self.config.data.train_data_dir)
+        cond_dir_str = self.config.data.get("conditioning_data_dir", None)
+        if not cond_dir_str or not Path(cond_dir_str).exists():
+            logger.warning("conditioning_data_dir 不存在，跳过验证集拆分")
+            self._val_exclude_stems = set()
+            return
+
+        cond_dir = Path(cond_dir_str)
+        cond_index = _build_cond_index(cond_dir)
+
+        train_images = sorted(
+            p for p in train_dir.iterdir()
+            if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
+        )
+
+        paired: list[tuple[str, Path, Path]] = []
+        for img_path in train_images:
+            fname = img_path.name
+            base_key = None
+            for orig_suffix, _ in _KNOWN_SUFFIX_PAIRS:
+                base_key = _strip_known_suffix(fname, orig_suffix)
+                if base_key is not None:
+                    break
+            if base_key is None:
+                base_key = img_path.stem
+            cond_path = cond_index.get(base_key)
+            if cond_path is not None:
+                paired.append((base_key, img_path, cond_path))
+
+        seed = int(val_cfg.get("val_split_seed", 42))
+        rng = random.Random(seed)
+        selected = rng.sample(paired, min(num_split, len(paired)))
+
+        if self.accelerator.is_main_process:
+            train_split_dir = split_dir / "train"
+            cond_split_dir = split_dir / "conditioning"
+            train_split_dir.mkdir(parents=True, exist_ok=True)
+            cond_split_dir.mkdir(parents=True, exist_ok=True)
+
+            base_keys = []
+            train_files = []
+            cond_files = []
+            for base_key, train_path, cond_path in selected:
+                shutil.copy2(train_path, train_split_dir / train_path.name)
+                shutil.copy2(cond_path, cond_split_dir / cond_path.name)
+                base_keys.append(base_key)
+                train_files.append(train_path.name)
+                cond_files.append(cond_path.name)
+
+            manifest = {
+                "base_keys": base_keys,
+                "train_files": train_files,
+                "cond_files": cond_files,
+                "seed": seed,
+                "num_split": len(selected),
+            }
+            with open(manifest_path, "w") as f:
+                json.dump(manifest, f, indent=2, ensure_ascii=False)
+
+            logger.info(
+                f"验证集拆分完成: {len(selected)} 对图片 → {split_dir} "
+                f"(seed={seed})"
+            )
+
+        self.accelerator.wait_for_everyone()
+
+        if not self.accelerator.is_main_process:
+            with open(manifest_path, "r") as f:
+                manifest = json.load(f)
+
+        self._val_exclude_stems = set(manifest["base_keys"])
+
     def _build_dataloader(self) -> DataLoader:
         data_cfg = self.config.data
         batch_size = self.training_cfg.get("train_batch_size", 2)
@@ -176,6 +279,7 @@ class PixArtControlNetTrainer(BaseTrainer):
             text_embed_cache_dir=text_embed_cache_dir,
             use_bucketing=use_bucketing,
             pad_color=pad_color,
+            exclude_stems=getattr(self, "_val_exclude_stems", None),
         )
 
         if use_bucketing:
@@ -417,6 +521,9 @@ class PixArtControlNetTrainer(BaseTrainer):
         """PixArt-Sigma ControlNet 主训练循环。"""
         self.vae.to(self.accelerator.device, dtype=torch.float32)
 
+        # 阶段0: 验证集拆分（首次运行时从训练集抽取，恢复时复用 manifest）
+        self._prepare_validation_split()
+
         # 阶段1: 条件图 latent 预计算（仅 VAE 模式）
         # 必须在目标图预计算之前执行，因为后者结束时会删除 VAE encoder
         if self.conditioning_mode == "vae":
@@ -584,7 +691,11 @@ class PixArtControlNetTrainer(BaseTrainer):
         else:
             val_prompts = list(val_cfg.get("prompts", ["a test image"]))
 
-        num_val_samples = val_cfg.get("num_val_samples", None)
+        # 有 val_split 时，验证数量以拆分集为准
+        if getattr(self, "_val_exclude_stems", None):
+            num_val_samples = len(self._val_exclude_stems)
+        else:
+            num_val_samples = val_cfg.get("num_val_samples", None)
         if num_val_samples is not None and len(val_prompts) < num_val_samples:
             val_prompts = (val_prompts * ((num_val_samples // len(val_prompts)) + 1))[:num_val_samples]
 
@@ -891,19 +1002,55 @@ class PixArtControlNetTrainer(BaseTrainer):
     def _load_val_images(self):
         """加载验证用条件图像和对应训练原图。
 
-        当 per_image caption 模式时，按训练图排序顺序选取对应条件图，
-        确保 conditioning_images[i], val_prompts[i], ground_truth[i] 三者配对。
+        优先级:
+          1. val_split/ 拆分目录（由 _prepare_validation_split 生成）
+          2. 配置中显式指定的 val_conditioning_images
+          3. per_image caption 模式下随机配对采样
+          4. 固定 caption 模式下随机采样条件图
         """
         from PIL import Image as PIL_Image
         from data.controlnet_dataset import (
             _KNOWN_SUFFIX_PAIRS, _strip_known_suffix, _build_cond_index,
         )
+        from data.dataset import IMAGE_EXTENSIONS
 
         val_cfg = self.config.get("validation", {})
-        n = val_cfg.get("num_val_samples", len(list(val_cfg.get("prompts", [""]))))
         resolution = self.config.data.get("resolution", 1024)
-        _IMG_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 
+        # ── 最高优先级: 从 val_split/ 拆分目录加载 ──
+        split_dir = Path(self.training_cfg.output_dir) / "val_split"
+        manifest_path = split_dir / "manifest.json"
+        if manifest_path.exists():
+            with open(manifest_path, "r") as f:
+                manifest = json.load(f)
+
+            cond_split_dir = split_dir / "conditioning"
+            train_split_dir = split_dir / "train"
+
+            cond_files = [cond_split_dir / name for name in manifest["cond_files"]]
+            train_files = [train_split_dir / name for name in manifest["train_files"]]
+
+            conditioning_images = [
+                PIL_Image.open(f).convert("RGB").resize((resolution, resolution))
+                for f in cond_files if f.exists()
+            ]
+            ground_truth_images = [
+                PIL_Image.open(f).convert("RGB").resize((resolution, resolution))
+                for f in train_files if f.exists()
+            ]
+
+            self._val_matched_train_stems = [
+                Path(name).stem for name in manifest["train_files"]
+            ]
+
+            logger.info(
+                f"验证集从 val_split/ 加载: {len(conditioning_images)} 张条件图, "
+                f"{len(ground_truth_images)} 张原图"
+            )
+            return conditioning_images, ground_truth_images
+
+        # ── Fallback: 原有逻辑 ──
+        n = val_cfg.get("num_val_samples", len(list(val_cfg.get("prompts", [""]))))
         train_dir = Path(self.config.data.get("train_data_dir", ""))
         cond_dir_str = self.config.data.get("conditioning_data_dir", None)
 
@@ -912,19 +1059,15 @@ class PixArtControlNetTrainer(BaseTrainer):
 
         val_cond_paths = list(val_cfg.get("val_conditioning_images", []))
         if val_cond_paths:
-            # 显式指定的验证条件图（最高优先级）
             sampled_cond_files = [Path(p) for p in val_cond_paths[:n]]
         elif getattr(self, "_per_image_caption", False) and cond_dir_str:
-            # 逐图 caption 模式: 随机采样 n 对配对的 (训练图, 条件图)
-            import random
             cond_dir = Path(cond_dir_str)
             if cond_dir.exists() and train_dir.exists():
                 cond_index = _build_cond_index(cond_dir)
                 train_images = sorted(
                     p for p in train_dir.iterdir()
-                    if p.is_file() and p.suffix.lower() in _IMG_EXTS
+                    if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
                 )
-                # 筛选有对应条件图的训练图，再随机抽样
                 paired: list[tuple[Path, Path]] = []
                 for img_path in train_images:
                     fname = img_path.name
@@ -945,18 +1088,17 @@ class PixArtControlNetTrainer(BaseTrainer):
                     matched_train_files.append(train_path)
                     sampled_cond_files.append(cond_path)
                 logger.info(
-                    f"验证条件图（随机配对采样, seed={val_cfg.get('seed', 42)}）：{[f.name for f in sampled_cond_files]}"
+                    f"验证条件图（随机配对采样, seed={val_cfg.get('seed', 42)}）："
+                    f"{[f.name for f in sampled_cond_files]}"
                 )
         elif cond_dir_str:
-            # 固定 caption 模式: 随机采样（条件图之间无需与特定 caption 配对）
             cond_path = Path(cond_dir_str)
             if cond_path.exists():
                 files = sorted(
                     f for f in cond_path.iterdir()
-                    if f.is_file() and f.suffix.lower() in _IMG_EXTS
+                    if f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS
                 )
                 if files:
-                    import random
                     rng = random.Random(42)
                     sampled_cond_files = rng.sample(files, min(n, len(files)))
                     logger.info(f"验证条件图采样：{[f.name for f in sampled_cond_files]}")
@@ -970,26 +1112,22 @@ class PixArtControlNetTrainer(BaseTrainer):
             for f in sampled_cond_files
         ]
 
-        # 记录匹配到的训练图 stem，供 _run_validation 加载对应嵌入
         self._val_matched_train_stems = [
             f.stem if f is not None else None for f in matched_train_files
         ] if matched_train_files else []
 
-        # 加载 ground truth（训练原图）
         ground_truth_images = None
         if matched_train_files:
-            # 逐图模式: 已有精确配对
             gt_images = [
                 PIL_Image.open(f).convert("RGB").resize((resolution, resolution))
                 if f is not None else None
                 for f in matched_train_files
             ]
         elif train_dir.exists():
-            # 固定 caption / 显式条件图: 通过 base_key 反查训练图
             gt_images = []
             train_index: dict[str, Path] = {}
             for f in train_dir.iterdir():
-                if not f.is_file() or f.suffix.lower() not in _IMG_EXTS:
+                if not f.is_file() or f.suffix.lower() not in IMAGE_EXTENSIONS:
                     continue
                 bk = None
                 for orig_suffix, _ in _KNOWN_SUFFIX_PAIRS:

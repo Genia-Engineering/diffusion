@@ -358,6 +358,7 @@ class PixArtIPAdapterTrainer(BaseTrainer):
             clip_feature_cache_dir=self._get_clip_feature_cache_dir(),
             resolution=resolution,
             random_flip=data_cfg.get("random_flip", True),
+            exclude_stems=getattr(self, "_val_exclude_stems", None),
         )
 
         dataset.set_bucket_assignments(bucket_to_indices)
@@ -465,6 +466,22 @@ class PixArtIPAdapterTrainer(BaseTrainer):
     def _load_val_ground_truth_images(self, n: int) -> list:
         data_cfg = self.config.data
         resolution = data_cfg.get("resolution", 1024)
+
+        split_dir = Path(self.training_cfg.output_dir) / "val_split"
+        manifest_path = split_dir / "manifest.json"
+        if manifest_path.exists():
+            import json
+            with open(manifest_path, "r") as f:
+                manifest = json.load(f)
+            train_split_dir = split_dir / "train"
+            images = []
+            for name in manifest["train_files"]:
+                p = train_split_dir / name
+                if p.exists():
+                    images.append(Image.open(p).convert("RGB").resize((resolution, resolution)))
+            logger.info(f"验证 ground truth 从 val_split/ 加载: {len(images)} 张")
+            return images
+
         dataset = BaseImageDataset(
             data_dir=data_cfg.train_data_dir,
             resolution=resolution,
@@ -534,6 +551,8 @@ class PixArtIPAdapterTrainer(BaseTrainer):
 
     def train(self):
         """IP-Adapter PixArt-Sigma 训练主循环。"""
+        self._prepare_validation_split()
+
         # ── 阶段1: 目标图 VAE latent 预缓存 ──────────────────────────
         self.vae.to(self.accelerator.device, dtype=torch.float32)
         if self.training_cfg.get("cache_latents", True):
@@ -709,6 +728,11 @@ class PixArtIPAdapterTrainer(BaseTrainer):
 
         num_val_images = val_cfg.get("num_val_images", 4)
         val_prompts = [f"cond_{i}" for i in range(num_val_images)]
+
+        if getattr(self, "_val_exclude_stems", None):
+            num_val = len(self._val_exclude_stems)
+            if len(val_prompts) < num_val:
+                val_prompts = (val_prompts * ((num_val // len(val_prompts)) + 1))[:num_val]
 
         val_loop = ValidationLoop(
             prompts=val_prompts,

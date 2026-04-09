@@ -42,6 +42,7 @@ class PixArtImgCondCachedLatentDataset(BaseImageDataset):
         cond_encoder_type: str = "dinov2",
         resolution: int = 1024,
         random_flip: bool = True,
+        exclude_stems: set[str] | None = None,
     ):
         super().__init__(
             data_dir, resolution=resolution,
@@ -62,6 +63,13 @@ class PixArtImgCondCachedLatentDataset(BaseImageDataset):
         else:
             self._cond_index = {}
             logger.warning(f"Conditioning dir not found: {conditioning_data_dir}")
+
+        if exclude_stems:
+            import logging as _logging
+            _logger = _logging.getLogger(__name__)
+            before = len(self.image_paths)
+            self.image_paths = [p for p in self.image_paths if p.stem not in exclude_stems]
+            _logger.info(f"验证集排除: {before} → {len(self.image_paths)} (排除 {before - len(self.image_paths)} 张)")
 
     def _get_base_key(self, idx: int) -> str:
         fname = self.image_paths[idx].name

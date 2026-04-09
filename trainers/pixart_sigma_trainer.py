@@ -170,6 +170,7 @@ class PixArtSigmaTrainer(BaseTrainer):
                 random_flip=data_cfg.get("random_flip", True),
                 fixed_caption=fixed_caption,
                 text_embed_cache_dir=text_embed_cache_dir,
+                exclude_stems=getattr(self, "_val_exclude_stems", None),
             )
         else:
             dataset = PixArtSigmaDataset(
@@ -241,15 +242,33 @@ class PixArtSigmaTrainer(BaseTrainer):
         return images
 
     def _load_val_ground_truth_images(self, n: int) -> list:
-        """从训练数据集按顺序取前 n 张图作为验证对比用的 ground truth。
+        """加载验证用 ground truth 图像。
 
-        使用固定顺序（非随机）确保每次验证对比的是同一批图像，
-        便于直观追踪过拟合进度。
+        优先从 val_split/train/ 加载（验证集拆分模式），
+        否则按固定顺序取训练集前 n 张。
         """
-        from data.dataset import BaseImageDataset
+        from PIL import Image as PIL_Image
+        from data.dataset import BaseImageDataset, IMAGE_EXTENSIONS
 
         data_cfg = self.config.data
         resolution = data_cfg.get("resolution", 1024)
+
+        split_dir = Path(self.training_cfg.output_dir) / "val_split"
+        manifest_path = split_dir / "manifest.json"
+        if manifest_path.exists():
+            import json
+            with open(manifest_path, "r") as f:
+                manifest = json.load(f)
+            train_split_dir = split_dir / "train"
+            images = []
+            for name in manifest["train_files"]:
+                p = train_split_dir / name
+                if p.exists():
+                    images.append(
+                        PIL_Image.open(p).convert("RGB").resize((resolution, resolution))
+                    )
+            logger.info(f"验证 ground truth 从 val_split/ 加载: {len(images)} 张")
+            return images
 
         dataset = BaseImageDataset(
             data_dir=data_cfg.train_data_dir,
@@ -266,6 +285,9 @@ class PixArtSigmaTrainer(BaseTrainer):
         """PixArt-Sigma 全参数微调主训练循环。"""
         cache_latents = self.training_cfg.get("cache_latents", False)
         cache_text_embeddings = self.training_cfg.get("cache_text_embeddings", False)
+
+        # ── 阶段0：验证集拆分 ──
+        self._prepare_validation_split()
 
         # ── 阶段1：VAE latent 预计算（完成后卸载 encoder 释放显存）────────────
         self.vae.to(self.accelerator.device, dtype=torch.float32)
@@ -380,6 +402,12 @@ class PixArtSigmaTrainer(BaseTrainer):
                 val_prompts = [self.config.data.get("caption", "a test image")]
         else:
             val_prompts = list(val_cfg.get("prompts", ["a test image"]))
+
+        if getattr(self, "_val_exclude_stems", None):
+            num_val = len(self._val_exclude_stems)
+            if len(val_prompts) < num_val:
+                val_prompts = (val_prompts * ((num_val // len(val_prompts)) + 1))[:num_val]
+
         raw_strengths = val_cfg.get("img2img_strength", None)
         if raw_strengths is None:
             img2img_strengths = []

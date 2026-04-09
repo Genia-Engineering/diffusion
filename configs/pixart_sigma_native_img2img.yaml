@@ -102,6 +102,8 @@ data:
 
 validation:
   num_val_images: 4
+  num_val_split: 20
+  val_split_seed: 42
   num_inference_steps: 50
   guidance_scale: 4.5
   seed: 42

@@ -411,11 +411,24 @@ class PixArtSigmaCachedLatentDataset(BaseImageDataset):
         fixed_caption: str = "",
         max_train_samples: int | None = None,
         text_embed_cache_dir: str | None = None,
+        exclude_stems: set[str] | None = None,
     ):
         super().__init__(data_dir, resolution, center_crop=False, random_flip=False, max_train_samples=max_train_samples)
         self.cache_dir = Path(cache_dir)
         self.do_random_flip = random_flip
         self.text_embed_cache_dir = Path(text_embed_cache_dir) if text_embed_cache_dir else None
+
+        if exclude_stems:
+            import logging as _logging
+            _logger = _logging.getLogger(__name__)
+            before = len(self.image_paths)
+            self.image_paths = [
+                p for p in self.image_paths if p.stem not in exclude_stems
+            ]
+            _logger.info(
+                f"验证集排除: {before} → {len(self.image_paths)} "
+                f"(排除 {before - len(self.image_paths)} 张)"
+            )
 
         if self.text_embed_cache_dir is None:
             tokenized = tokenizer(

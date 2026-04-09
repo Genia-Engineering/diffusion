@@ -52,28 +52,28 @@ controlnet_xs:
 
 training:
   output_dir: "./outputs/controlnet_xs_pixart_sigma_dual_lr"
-  num_train_steps: 8000                 # ~60 epoch
+  num_train_steps: 5000                 # ~60 epoch
   # 主干网络学习率 — 预训练权重使用较小 lr 防止灾难性遗忘
-  learning_rate: 5.0e-5
-  train_batch_size: 8
+  learning_rate: 2.0e-5
+  train_batch_size: 4
   gradient_accumulation_steps: 4        # effective batch = 2×1GPU×4accum = 8
   mixed_precision: "bf16"
   cache_latents: true
   cache_text_embeddings: true
   latent_cache_batch_size: 4
 
-  validation_steps: 500
-  save_steps: 500
-  keep_last_n_checkpoints: 12
+  validation_steps: 300
+  save_steps: 300
+  keep_last_n_checkpoints: 16
 
   save_best: true
   best_loss_ema_decay: 0.99
 
-  use_ema: true
-  ema_decay: 0.9999
+  use_ema: false 
+  ema_decay: 0.999
   ema_update_after_step: 400            # warmup 阶段学习率不稳定，跳过 EMA 更新
 
-  lr_warmup_steps: 400                  # 前 ~10% 总步数 warmup
+  lr_warmup_steps: 200                  # 前 ~10% 总步数 warmup
   lr_min_ratio: 0.2                      # cosine 最低衰减到 peak_lr 的 10%
   gradient_checkpointing: true
   attention_backend: "sdpa"
@@ -111,6 +111,8 @@ data:
 
 validation:
   num_val_samples: 4
+  num_val_split: 20
+  val_split_seed: 42
 
   prompt_source: "config"
 
@@ -122,3 +124,40 @@ validation:
   guidance_scale: 4.5
   seed: 42
   num_images_per_prompt: 1
+
+# ── 辅助结构 loss ──────────────────────────────────────────────────
+#
+# 目的: 让模型更好地学习控制图中各颜色块对应区域的结构信息，
+#       只关注"该位置是否有内容"，不关注具体颜色。
+#
+# 计算流程:
+#   1. 从 batch 中随机抽取 ≤ max_decode_samples 个低 t 样本
+#   2. 由 noise_pred 可微地推算 x0_pred → VAE decode → 像素空间 RGB
+#   3. max(R,G,B) + sigmoid 软阈值 → 结构图 pred_soft ∈ [0,1]
+#   4. 与预缓存的原图二值 mask 做 weighted MSE
+#
+# 注意: 启用后 VAE decoder 常驻 GPU，额外 ~200MB 显存。
+#
+auxiliary_loss:
+  enabled: true
+  weight: 0.003                    # total_loss = diffusion_loss + weight × aux_loss
+  timestep_threshold: 700          # t < threshold 的样本才计算 (t_quality 线性衰减)
+  fg_threshold: 0.1                # 前景判定阈值 (归一化 [0,1] 后)
+  temperature: 20.0                # 预测侧软阈值陡峭度
+  max_decode_samples: 4            # 每步最多 VAE decode 的样本数 (控制显存)
+  bg_weight: 0.0                   # 背景区域权重 (0=完全忽略背景)
+  labels:
+    - rgb: [220, 120, 0]           # label_6_deck    平台/甲板 (橙色)
+      weight: 3.0
+    - rgb: [220, 0, 0]             # label_4_doors   门 (红色)
+      weight: 5.0
+    - rgb: [20, 50, 230]           # label_5_general_opening  通用开口 (蓝色)
+      weight: 0.0
+    - rgb: [230, 230, 230]         # label_7_walls   墙体 (浅灰)
+      weight: 5.0
+    - rgb: [220, 220, 0]           # label_5_stair_opening  楼梯开口 (黄色)
+      weight: 1.0
+    - rgb: [0, 200, 0]             # label_4_windows 窗户 (绿色)
+      weight: 5.0
+    - rgb: [180, 0, 200]           # label_8_posts   立柱/柱子 (紫色)
+      weight: 1.0

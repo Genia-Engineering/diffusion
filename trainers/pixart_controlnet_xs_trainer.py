@@ -15,6 +15,7 @@ import logging
 
 import torch
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 from omegaconf import DictConfig
 
 from models.controlnet_xs_pixart import (
@@ -96,8 +97,13 @@ class PixArtControlNetXSTrainer(PixArtControlNetTrainer):
         self._aux_temperature = float(aux_cfg.get("temperature", 20.0))
         self._aux_bg_weight = float(aux_cfg.get("bg_weight", 0.0))
         self._aux_max_decode = int(aux_cfg.get("max_decode_samples", 2))
+        self._aux_sequential_decode = bool(aux_cfg.get("sequential_decode", False))
         self._last_aux_loss: float | None = None
         self._last_diffusion_loss: float | None = None
+
+        if hasattr(self.vae, "enable_gradient_checkpointing"):
+            self.vae.enable_gradient_checkpointing()
+            logger.info("VAE gradient checkpointing enabled for auxiliary loss")
 
         labels = list(aux_cfg.get("labels", []))
         if not labels:
@@ -118,7 +124,7 @@ class PixArtControlNetXSTrainer(PixArtControlNetTrainer):
             f"Auxiliary structure loss: weight={self._aux_weight}, "
             f"t_threshold={self._aux_t_threshold}, fg_threshold={self._aux_fg_threshold}, "
             f"temperature={self._aux_temperature}, max_decode={self._aux_max_decode}, "
-            f"{len(labels)} labels"
+            f"sequential_decode={self._aux_sequential_decode}, {len(labels)} labels"
         )
 
     @torch.no_grad()
@@ -160,6 +166,10 @@ class PixArtControlNetXSTrainer(PixArtControlNetTrainer):
 
         return weight_map
 
+    def _vae_decode_fn(self, latents: torch.Tensor) -> torch.Tensor:
+        """VAE decode 的薄包装，供 torch_checkpoint 调用。"""
+        return self.vae.decode(latents, return_dict=True).sample
+
     def _predict_x0(
         self,
         noisy_latents: torch.Tensor,
@@ -180,6 +190,20 @@ class PixArtControlNetXSTrainer(PixArtControlNetTrainer):
             x0 = (noisy_latents - sqrt_one_minus_alpha_bar * noise_pred) / sqrt_alpha_bar.clamp(min=1e-8)
         return x0
 
+    def _decode_single_sample(self, x0_single: torch.Tensor) -> torch.Tensor:
+        """对单个样本做 VAE decode → 软阈值结构图，逐样本处理控制显存峰值。"""
+        scaling_factor = self.vae.config.scaling_factor
+        latent = x0_single.unsqueeze(0) / scaling_factor
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            decoded = torch_checkpoint(
+                self._vae_decode_fn, latent, use_reentrant=False,
+            )
+        rgb = (decoded.squeeze(0) + 1.0) / 2.0
+        pred_max = rgb.max(dim=0).values
+        return torch.sigmoid(
+            (pred_max - self._aux_fg_threshold) * self._aux_temperature
+        )
+
     def _compute_auxiliary_loss(
         self,
         noise_pred: torch.Tensor,
@@ -190,10 +214,8 @@ class PixArtControlNetXSTrainer(PixArtControlNetTrainer):
     ) -> torch.Tensor | None:
         """计算辅助结构 loss。
 
-        流程：预测 x0 → VAE decode → 归一化 → max-channel → 软阈值 →
-             × mask → 与原图二值 max-channel × mask 做 MSE（前景归一化）
-
         仅对 t < threshold 的样本计算；若 batch 中无符合条件的样本则返回 None。
+        sequential_decode=True 时逐样本 VAE decode 以降低显存峰值。
         """
         low_t_mask = timesteps < self._aux_t_threshold
         if not low_t_mask.any():
@@ -203,54 +225,81 @@ class PixArtControlNetXSTrainer(PixArtControlNetTrainer):
         if len(idx) > self._aux_max_decode:
             perm = torch.randperm(len(idx), device=idx.device)[: self._aux_max_decode]
             idx = idx[perm]
+
+        if "orig_max_channel" not in batch:
+            logger.warning(
+                "batch 中缺少 orig_max_channel，请重新生成 latent 缓存。跳过本步辅助 loss。"
+            )
+            return None
+
         sel_noise_pred = noise_pred[idx]
         sel_noisy_latents = noisy_latents[idx]
         sel_timesteps = timesteps[idx]
         sel_cond = conditioning_pixel_values[idx]
 
-        # 1. 预测 x0（有梯度）
         x0_pred = self._predict_x0(sel_noisy_latents, sel_noise_pred, sel_timesteps)
 
-        # 2. VAE decode（权重冻结但保留计算图，梯度穿过 VAE 回传到模型）
+        if self._aux_sequential_decode:
+            return self._aux_loss_sequential(x0_pred, sel_timesteps, sel_cond, idx, batch)
+        return self._aux_loss_batched(x0_pred, sel_timesteps, sel_cond, idx, batch)
+
+    def _aux_loss_batched(self, x0_pred, sel_timesteps, sel_cond, idx, batch):
+        """批量 VAE decode（默认模式，速度快但显存占用高）。"""
         scaling_factor = self.vae.config.scaling_factor
         x0_for_decode = x0_pred / scaling_factor
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            decoded = self.vae.decode(x0_for_decode, return_dict=True).sample  # (B', 3, H, W)
+            decoded = torch_checkpoint(
+                self._vae_decode_fn, x0_for_decode, use_reentrant=False,
+            )
 
-        # 3. 归一化 [-1,1] → [0,1] → max-channel → 软阈值
         normalized = (decoded + 1.0) / 2.0
-        pred_max = normalized.max(dim=1).values  # (B', H, W)
+        pred_max = normalized.max(dim=1).values
         pred_soft = torch.sigmoid(
             (pred_max - self._aux_fg_threshold) * self._aux_temperature
         )
 
-        # 4. 原图二值 max-channel（预缓存，无梯度）
-        if "orig_max_channel" not in batch:
-            logger.warning(
-                "batch 中缺少 orig_max_channel，请重新生成 latent 缓存。"
-                "跳过本步辅助 loss。"
-            )
-            return None
-        orig_binary = batch["orig_max_channel"][idx].to(pred_soft.device)  # (B', 1, H/f, W/f)
-        orig_binary = orig_binary.squeeze(1)  # (B', H/f, W/f)
+        orig_binary = batch["orig_max_channel"][idx].to(pred_soft.device).squeeze(1)
         if orig_binary.shape[-2:] != pred_soft.shape[-2:]:
             orig_binary = F.interpolate(
-                orig_binary.unsqueeze(1), size=pred_soft.shape[-2:],
-                mode="nearest",
+                orig_binary.unsqueeze(1), size=pred_soft.shape[-2:], mode="nearest",
             ).squeeze(1)
-
         orig_binary = orig_binary.detach()
 
-        # 5. 控制图 per-label 权重 mask
         weight_mask = self._build_label_weight_mask(sel_cond, pred_soft.shape[-2:])
+        t_quality = 1.0 - sel_timesteps.float() / self._aux_t_threshold
 
-        # 6. 按 timestep 衰减的质量权重（t 越小 x0_pred 越可靠，权重越高）
-        t_quality = 1.0 - sel_timesteps.float() / self._aux_t_threshold  # (B',)
-
-        # 7. Weighted MSE：先算 MSE 再乘权重（线性加权，避免 w² 放大）
         diff_sq = (pred_soft - orig_binary).pow(2) * weight_mask * t_quality[:, None, None]
         fg_count = (weight_mask > 0).sum().clamp(min=1)
         aux_loss = diff_sq.sum() / fg_count
+
+        self._last_aux_loss = aux_loss.item()
+        return aux_loss
+
+    def _aux_loss_sequential(self, x0_pred, sel_timesteps, sel_cond, idx, batch):
+        """逐样本 VAE decode（sequential_decode=True 时使用，显存友好）。"""
+        total_weighted_sq = torch.tensor(0.0, device=x0_pred.device)
+        total_fg_count = 0
+
+        for i in range(len(idx)):
+            pred_soft_i = self._decode_single_sample(x0_pred[i])
+            hw = pred_soft_i.shape[-2:]
+
+            orig_i = batch["orig_max_channel"][idx[i]].to(pred_soft_i.device).squeeze(0)
+            if orig_i.shape[-2:] != hw:
+                orig_i = F.interpolate(
+                    orig_i.unsqueeze(0).unsqueeze(0), size=hw, mode="nearest",
+                ).squeeze(0).squeeze(0)
+            orig_i = orig_i.detach()
+
+            wm_i = self._build_label_weight_mask(sel_cond[i:i + 1], hw).squeeze(0)
+            tq_i = 1.0 - sel_timesteps[i].float() / self._aux_t_threshold
+
+            diff_sq_i = (pred_soft_i - orig_i).pow(2) * wm_i * tq_i
+            total_weighted_sq = total_weighted_sq + diff_sq_i.sum()
+            total_fg_count += (wm_i > 0).sum().item()
+
+        fg_count = max(total_fg_count, 1)
+        aux_loss = total_weighted_sq / fg_count
 
         self._last_aux_loss = aux_loss.item()
         return aux_loss
@@ -365,5 +414,8 @@ class PixArtControlNetXSTrainer(PixArtControlNetTrainer):
             conditioning_pixel_values, batch,
         )
         if aux_loss is not None:
-            return diffusion_loss + self._aux_weight * aux_loss
+            aux_weighted = self._aux_weight * aux_loss
+            max_aux = 0.5 * diffusion_loss.detach()
+            aux_weighted = torch.clamp(aux_weighted, max=max_aux)
+            return diffusion_loss + aux_weighted
         return diffusion_loss

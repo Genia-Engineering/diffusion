@@ -74,6 +74,8 @@ data:
   t5_max_length: 300
 
 validation:
+  num_val_split: 20
+  val_split_seed: 42
   prompts:
     - "architectural floor plan, blueprint, technical drawing"
     - "architectural floor plan, blueprint, technical drawing"

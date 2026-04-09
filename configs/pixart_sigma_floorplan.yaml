@@ -111,6 +111,8 @@ data:
   caption_fallback: "architectural floor plan, blueprint, technical drawing"
 
 validation:
+  num_val_split: 20
+  val_split_seed: 42
   prompts:
     - "architectural floor plan, blueprint, technical drawing"
     # - "a detailed residential floor plan showing room layout"

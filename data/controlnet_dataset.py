@@ -386,6 +386,7 @@ class PixArtControlNetCachedLatentDataset(BaseImageDataset):
         text_embed_cache_dir: str | None = None,
         use_bucketing: bool = True,
         pad_color: tuple[int, ...] = (0, 0, 0),
+        exclude_stems: set[str] | None = None,
     ):
         super().__init__(
             data_dir, resolution=1024, center_crop=False, random_flip=False,
@@ -411,6 +412,17 @@ class PixArtControlNetCachedLatentDataset(BaseImageDataset):
                 self._filter_unpaired_images()
         else:
             self._cond_index = {}
+
+        if exclude_stems:
+            before = len(self.image_paths)
+            self.image_paths = [
+                p for p in self.image_paths
+                if self._get_base_key_from_path(p) not in exclude_stems
+            ]
+            logger.info(
+                f"[PixArt-CN] 验证集排除: {before} → {len(self.image_paths)} "
+                f"(排除 {before - len(self.image_paths)} 张)"
+            )
 
         # VAE 模式: 条件 latent 缓存目录
         self.conditioning_latent_cache_dir = (

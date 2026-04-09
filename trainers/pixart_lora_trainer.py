@@ -195,6 +195,7 @@ class PixArtLoRATrainer(BaseTrainer):
                 random_flip=data_cfg.get("random_flip", True),
                 fixed_caption=fixed_caption,
                 text_embed_cache_dir=text_embed_cache_dir,
+                exclude_stems=getattr(self, "_val_exclude_stems", None),
             )
         else:
             dataset = PixArtSigmaDataset(
@@ -259,10 +260,28 @@ class PixArtLoRATrainer(BaseTrainer):
         return images
 
     def _load_val_ground_truth_images(self, n: int) -> list:
+        from PIL import Image as PIL_Image
         from data.dataset import BaseImageDataset
 
         data_cfg = self.config.data
         resolution = data_cfg.get("resolution", 1024)
+
+        split_dir = Path(self.training_cfg.output_dir) / "val_split"
+        manifest_path = split_dir / "manifest.json"
+        if manifest_path.exists():
+            import json
+            with open(manifest_path, "r") as f:
+                manifest = json.load(f)
+            train_split_dir = split_dir / "train"
+            images = []
+            for name in manifest["train_files"]:
+                p = train_split_dir / name
+                if p.exists():
+                    images.append(
+                        PIL_Image.open(p).convert("RGB").resize((resolution, resolution))
+                    )
+            logger.info(f"验证 ground truth 从 val_split/ 加载: {len(images)} 张")
+            return images
 
         dataset = BaseImageDataset(
             data_dir=data_cfg.train_data_dir,
@@ -271,7 +290,6 @@ class PixArtLoRATrainer(BaseTrainer):
             random_flip=False,
         )
 
-        # 若已通过随机采样确定了验证图片索引，则与 caption 一一对应加载同一批图片
         if hasattr(self, "_val_sample_image_indices") and self._val_sample_image_indices:
             indices = [i for i in self._val_sample_image_indices if i < len(dataset)]
         else:
@@ -283,6 +301,9 @@ class PixArtLoRATrainer(BaseTrainer):
         """PixArt-Sigma LoRA 微调主训练循环。"""
         cache_latents = self.training_cfg.get("cache_latents", False)
         cache_text_embeddings = self.training_cfg.get("cache_text_embeddings", False)
+
+        # ── 阶段0：验证集拆分 ──
+        self._prepare_validation_split()
 
         # ── 阶段1：VAE latent 预计算 ──
         self.vae.to(self.accelerator.device, dtype=torch.float32)
@@ -380,6 +401,12 @@ class PixArtLoRATrainer(BaseTrainer):
                 val_prompts = [self.config.data.get("caption", "a test image")]
         else:
             val_prompts = list(val_cfg.get("prompts", ["a test image"]))
+
+        if getattr(self, "_val_exclude_stems", None):
+            num_val = len(self._val_exclude_stems)
+            if len(val_prompts) < num_val:
+                val_prompts = (val_prompts * ((num_val // len(val_prompts)) + 1))[:num_val]
+
         raw_strengths = val_cfg.get("img2img_strength", None)
         if raw_strengths is None:
             img2img_strengths = []
