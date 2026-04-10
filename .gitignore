@@ -70,3 +70,4 @@ configs/controlnet_xs_pixart_sigma.yaml
 
 # Misc
 train_output.log
+*.yaml
