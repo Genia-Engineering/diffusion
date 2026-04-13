@@ -189,7 +189,7 @@ def run(pipeline, args, device):
     for ci_idx, ctrl_path in enumerate(args.control_images):
         logger.info(f"[{ci_idx + 1}/{len(args.control_images)}] 控制图: {ctrl_path}")
         ctrl_img = Image.open(ctrl_path).convert("RGB")
-        ctrl_img = ctrl_img.resize((args.width, args.height), Image.LANCZOS)
+        ctrl_img = ctrl_img.resize((args.width, args.height), Image.NEAREST)
 
         seed = args.seed if args.seed >= 0 else torch.randint(0, 2**31, (1,)).item()
         generator = torch.Generator(device=device).manual_seed(seed)

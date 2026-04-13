@@ -190,7 +190,7 @@ def _prompt_tag(prompt: str, max_len: int = 32) -> str:
 def _load_control_image(path: str, width: int, height: int) -> Image.Image:
     """加载并 resize 条件图像到目标分辨率。"""
     img = Image.open(path).convert("RGB")
-    img = img.resize((width, height), Image.LANCZOS)
+    img = img.resize((width, height), Image.NEAREST)
     return img
 
 

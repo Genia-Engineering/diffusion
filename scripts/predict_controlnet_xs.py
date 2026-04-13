@@ -20,6 +20,7 @@ import random
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
 from PIL import Image
 from tqdm import tqdm
@@ -133,6 +134,49 @@ def load_caption(caption_dir: Path, base_key: str, fallback: str) -> str:
     return fallback
 
 
+def drop_random_color(
+    img: Image.Image,
+    rng: random.Random,
+    skip_colors: set[tuple[int, int, int]] | None = None,
+    display_alpha: float = 0.25,
+) -> tuple[Image.Image, Image.Image, tuple[int, int, int] | None]:
+    """随机选择控制图中的一种颜色并移除。
+
+    跳过黑色和白色（通常为背景/边界），仅在剩余颜色中随机选取。
+    返回两个版本:
+      - model_img:  被舍弃的颜色完全替换为黑色，用于送入模型
+      - display_img: 被舍弃的颜色以 display_alpha 淡显，用于 grid 展示
+
+    Args:
+        display_alpha: 舍弃颜色在展示图中的保留强度 (0=全黑, 1=原色不变)
+
+    Returns:
+        (model_img, display_img, 被舍弃的颜色) — 无可用颜色时返回 (原图, 原图, None)
+    """
+    if skip_colors is None:
+        skip_colors = {(0, 0, 0), (255, 255, 255)}
+
+    arr = np.array(img)
+    pixels = arr.reshape(-1, 3)
+    unique_colors = set(map(tuple, np.unique(pixels, axis=0).tolist()))
+
+    candidate_colors = unique_colors - skip_colors
+    if not candidate_colors:
+        return img, img, None
+
+    color = rng.choice(sorted(candidate_colors))
+
+    mask = np.all(arr == np.array(color, dtype=np.uint8), axis=-1)
+
+    model_arr = arr.copy()
+    model_arr[mask] = [0, 0, 0]
+
+    display_arr = arr.copy()
+    display_arr[mask] = (np.array(color, dtype=np.float32) * display_alpha).astype(np.uint8)
+
+    return Image.fromarray(model_arr), Image.fromarray(display_arr), color
+
+
 def blend_images(
     base: Image.Image, overlay: Image.Image, alpha: float = 0.5
 ) -> Image.Image:
@@ -192,6 +236,7 @@ def run_inference_for_checkpoint(
     train_data_dir: str | None = None,
     prompt_mode: str = "fixed",
     finetuned_transformer_path: str | None = None,
+    drop_color: bool = False,
 ):
     """对单个检查点执行推理。"""
     ckpt_name = ckpt_dir.name
@@ -273,8 +318,14 @@ def run_inference_for_checkpoint(
     for i, (train_path, cond_path, base_key) in enumerate(tqdm(
         selected, desc=f"  [{ckpt_name}] 生成中"
     )):
-        cond_img = Image.open(cond_path).convert("RGB").resize((1024, 1024), Image.LANCZOS)
+        cond_img = Image.open(cond_path).convert("RGB").resize((1024, 1024), Image.NEAREST)
         gt_img = Image.open(train_path).convert("RGB").resize((1024, 1024), Image.LANCZOS)
+        cond_display = cond_img
+
+        if drop_color:
+            cond_img, cond_display, dropped = drop_random_color(cond_img, rng)
+            if dropped:
+                logger.info(f"  舍弃颜色: RGB{dropped}")
 
         # 构建 pipeline 参数: 优先使用预缓存嵌入
         if text_embed_cache is not None:
@@ -325,7 +376,7 @@ def run_inference_for_checkpoint(
             )
             gen_imgs.append(result.images[0])
 
-        grid = make_comparison_grid(cond_img, gen_imgs, gt_img, overlay_alpha=overlay_alpha)
+        grid = make_comparison_grid(cond_display, gen_imgs, gt_img, overlay_alpha=overlay_alpha)
         grid.save(save_dir / f"{i:03d}_grid.png")
 
         logger.info(f"  [{i+1}/{len(selected)}] {images_per_sample} images saved: {base_key[:60]}...")
@@ -343,7 +394,7 @@ def main():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="/home/daiqing_tan/stable_diffusion_lora/outputs/controlnet_xs_pixart_sigma_adapter_only",
+        default="/home/daiqing_tan/stable_diffusion_lora/outputs/controlnet_xs_pixart_sigma",
         help="训练输出目录",
     )
     parser.add_argument(
@@ -373,7 +424,7 @@ def main():
         type=str,
         default="/home/daiqing_tan/stable_diffusion_lora/data/data/description",
     )
-    parser.add_argument("--num_samples", type=int, default=10)
+    parser.add_argument("--num_samples", type=int, default=20)
     parser.add_argument("--images_per_sample", type=int, default=4, help="每个输入条件图生成几张输出")
     parser.add_argument("--steps", type=int, default=25)
     parser.add_argument("--cfg", type=float, default=4.5, help="Guidance scale")
@@ -395,7 +446,7 @@ def main():
     parser.add_argument(
         "--ckpt",
         type=str,
-        default=None,
+        default="step_008500",
         help="指定检查点名称 (如 best, step_003600)，默认遍历全部",
     )
     parser.add_argument(
@@ -408,6 +459,11 @@ def main():
         "--no_cached_embeds",
         action="store_true",
         help="禁用预缓存文本嵌入，使用实时 T5 编码",
+    )
+    parser.add_argument(
+        "--drop_color",
+        action="store_true",
+        help="随机舍弃控制图中的某一种颜色（替换为黑色），用于测试模型对缺失颜色的鲁棒性",
     )
     parser.add_argument(
         "--finetuned_transformer_path",
@@ -499,6 +555,7 @@ def main():
             train_data_dir=args.train_data_dir,
             prompt_mode=args.prompt_mode,
             finetuned_transformer_path=args.finetuned_transformer_path,
+            drop_color=args.drop_color,
         )
 
     logger.info(f"全部推理完成！结果保存在: {predict_root}")

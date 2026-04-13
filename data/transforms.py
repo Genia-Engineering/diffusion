@@ -25,19 +25,25 @@ class PairedRandomHorizontalFlip:
 class AspectRatioResize:
     """根据目标桶分辨率 resize 图像，保持宽高比后中心裁剪或直接 resize。"""
 
-    def __init__(self, target_size: tuple[int, int], center_crop: bool = True):
+    def __init__(
+        self,
+        target_size: tuple[int, int],
+        center_crop: bool = True,
+        resample: Image.Resampling = Image.LANCZOS,
+    ):
         self.target_w, self.target_h = target_size
         self.center_crop = center_crop
+        self.resample = resample
 
     def __call__(self, image: Image.Image) -> Image.Image:
         if self.center_crop:
             w, h = image.size
             scale = max(self.target_w / w, self.target_h / h)
             new_w, new_h = int(w * scale + 0.5), int(h * scale + 0.5)
-            image = image.resize((new_w, new_h), Image.LANCZOS)
+            image = image.resize((new_w, new_h), self.resample)
             image = TF.center_crop(image, (self.target_h, self.target_w))
         else:
-            image = image.resize((self.target_w, self.target_h), Image.LANCZOS)
+            image = image.resize((self.target_w, self.target_h), self.resample)
         return image
 
 
@@ -52,9 +58,11 @@ class AspectRatioPad:
         self,
         target_size: tuple[int, int],
         pad_color: tuple[int, ...] = (0, 0, 0),
+        resample: Image.Resampling = Image.LANCZOS,
     ):
         self.target_w, self.target_h = target_size
         self.pad_color = tuple(pad_color)
+        self.resample = resample
 
     def __call__(self, image: Image.Image) -> tuple[Image.Image, Image.Image]:
         """返回 (padded_image, padding_mask)。mask 为 L 模式 PIL 图像，255=内容/0=padding。"""
@@ -62,7 +70,7 @@ class AspectRatioPad:
         scale = min(self.target_w / w, self.target_h / h)
         new_w = round(w * scale)
         new_h = round(h * scale)
-        image = image.resize((new_w, new_h), Image.LANCZOS)
+        image = image.resize((new_w, new_h), self.resample)
 
         canvas = Image.new("RGB", (self.target_w, self.target_h), self.pad_color)
         paste_x = (self.target_w - new_w) // 2
@@ -106,7 +114,10 @@ def apply_transforms(
     resizer = AspectRatioResize(target_size, center_crop=center_crop)
     image = resizer(image)
     if conditioning_image is not None:
-        conditioning_image = resizer(conditioning_image)
+        cond_resizer = AspectRatioResize(
+            target_size, center_crop=center_crop, resample=Image.NEAREST,
+        )
+        conditioning_image = cond_resizer(conditioning_image)
 
     flip_fn = transforms_dict.get("flip")
     if flip_fn is not None:

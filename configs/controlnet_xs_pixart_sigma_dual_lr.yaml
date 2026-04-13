@@ -62,8 +62,8 @@ training:
   cache_text_embeddings: true
   latent_cache_batch_size: 4
 
-  validation_steps: 300
-  save_steps: 300
+  validation_steps: 500
+  save_steps: 500
   keep_last_n_checkpoints: 16
 
   save_best: true
@@ -139,7 +139,7 @@ validation:
 # 注意: 启用后 VAE decoder 常驻 GPU，额外 ~200MB 显存。
 #
 auxiliary_loss:
-  enabled: true
+  enabled: false
   weight: 0.003                    # total_loss = diffusion_loss + weight × aux_loss
   timestep_threshold: 700          # t < threshold 的样本才计算 (t_quality 线性衰减)
   fg_threshold: 0.1                # 前景判定阈值 (归一化 [0,1] 后)

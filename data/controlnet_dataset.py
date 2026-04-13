@@ -316,13 +316,13 @@ class CachedLatentControlNetDataset(BaseImageDataset):
         target_h, target_w = data["target_hw"].tolist()
         target_size = (target_w, target_h)  # (w, h)
 
-        # 加载条件图并调整到与 latent 对应的分辨率
+        # 加载条件图并调整到与 latent 对应的分辨率（NEAREST 保持语义颜色精确）
         cond_image = self._load_conditioning_image(idx)
         if self.use_bucketing:
-            resizer = AspectRatioResize(target_size, center_crop=self.center_crop)
+            resizer = AspectRatioResize(target_size, center_crop=self.center_crop, resample=Image.NEAREST)
             cond_image = resizer(cond_image)
         else:
-            padder = AspectRatioPad(target_size, pad_color=self.pad_color)
+            padder = AspectRatioPad(target_size, pad_color=self.pad_color, resample=Image.NEAREST)
             cond_image, _cond_mask = padder(cond_image)
         if use_flip:
             cond_image = TF.hflip(cond_image)
@@ -537,10 +537,10 @@ class PixArtControlNetCachedLatentDataset(BaseImageDataset):
         else:
             cond_image = self._load_conditioning_image(idx)
             if self.use_bucketing:
-                resizer = AspectRatioResize(target_size, center_crop=self.center_crop)
+                resizer = AspectRatioResize(target_size, center_crop=self.center_crop, resample=Image.NEAREST)
                 cond_image = resizer(cond_image)
             else:
-                padder = AspectRatioPad(target_size, pad_color=self.pad_color)
+                padder = AspectRatioPad(target_size, pad_color=self.pad_color, resample=Image.NEAREST)
                 cond_image, _cond_mask = padder(cond_image)
             if use_flip:
                 cond_image = TF.hflip(cond_image)
