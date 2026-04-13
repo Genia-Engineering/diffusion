@@ -417,7 +417,7 @@ def main():
     )
     parser.add_argument(
         "--output_dir", type=str,
-        default="/home/daiqing_tan/stable_diffusion_lora/outputs/controlnet_xs_pixart_sigma_adapter_only_train",
+        default="/home/daiqing_tan/stable_diffusion_lora/outputs/controlnet_xs_pixart_sigma_dual_lr_train",
         help="训练输出目录 (包含 checkpoints 子目录)",
     )
     parser.add_argument(
@@ -469,7 +469,7 @@ def main():
         help="fixed 模式下使用的统一提示词",
     )
     parser.add_argument(
-        "--ckpt", type=str, default="step_005000",
+        "--ckpt", type=str, default="step_003600",
         help="指定检查点名称 (如 best, step_003600)，留空遍历全部",
     )
     parser.add_argument(
